@@ -23,6 +23,12 @@ plot_predicted_risk_return(result_df, output_path=None)
     vs actual annualised return (y), coloured by risk profile.  Illustrates
     how the model's risk ordering aligns with realised return outcomes.
 
+plot_quarterly_sharpe(eval_df, output_path=None)
+    Grouped bar chart of mean actual Sharpe per risk profile per quarter.
+
+plot_classification_accuracy(eval_df, output_path=None)
+    Per-quarter Spearman ρ between label rank and actual forward volatility.
+
 save_or_show(fig, output_path)
     Save to file if path is given, otherwise display interactively.
 """
@@ -31,7 +37,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -599,20 +605,168 @@ def plot_rl_vs_actual_vol_timeseries(
     return fig
 
 
+def plot_quarterly_sharpe(
+    eval_df: pd.DataFrame,
+    output_path: Optional[str] = None,
+) -> plt.Figure:
+    """
+    Grouped bar chart of mean actual Sharpe ratio per risk profile per quarter.
+
+    X-axis : quarter_start dates
+    Y-axis : mean actual Sharpe ratio
+    Three bar groups per quarter: conservative (green), balanced (orange),
+    aggressive (red).
+
+    Parameters
+    ----------
+    eval_df : pd.DataFrame
+        Output of classify_assets() — evaluation DataFrame.
+        Must contain columns: quarter_start, risk_profile, actual_sharpe.
+    output_path : str, optional
+    """
+    grp = (
+        eval_df.dropna(subset=["actual_sharpe", "risk_profile"])
+        .groupby(["quarter_start", "risk_profile"])["actual_sharpe"]
+        .mean()
+        .reset_index()
+    )
+
+    if grp.empty:
+        logger.warning("plot_quarterly_sharpe: no data available — skipping")
+        fig, ax = plt.subplots()
+        ax.set_title("No data")
+        save_or_show(fig, output_path)
+        return fig
+
+    quarters = sorted(grp["quarter_start"].unique())
+    x        = np.arange(len(quarters))
+    width    = 0.25
+
+    fig, ax = plt.subplots(figsize=(max(10, len(quarters) * 1.2), 5))
+    sns.set_style("whitegrid")
+
+    for offset, profile in enumerate(PROFILE_ORDER):
+        pgrp = grp[grp["risk_profile"] == profile]
+        vals = []
+        for q in quarters:
+            row = pgrp[pgrp["quarter_start"] == q]
+            vals.append(float(row["actual_sharpe"].values[0]) if not row.empty else 0.0)
+        ax.bar(
+            x + (offset - 1) * width,
+            vals,
+            width=width,
+            color=PROFILE_COLOURS[profile],
+            alpha=0.85,
+            label=profile.capitalize(),
+            edgecolor="white",
+        )
+
+    ax.axhline(0, color="grey", linewidth=0.8, linestyle="--", alpha=0.6)
+    ax.set_xticks(x)
+    ax.set_xticklabels(
+        [str(pd.Timestamp(q).date()) for q in quarters],
+        rotation=45, ha="right", fontsize=8,
+    )
+    ax.set_xlabel("Quarter Start", fontsize=12)
+    ax.set_ylabel("Mean Actual Sharpe Ratio", fontsize=12)
+    ax.set_title(
+        "Quarterly Mean Sharpe by Risk Profile — Evaluation",
+        fontsize=14, fontweight="bold",
+    )
+    ax.legend(handles=_legend_patches(), fontsize=10)
+
+    fig.tight_layout()
+    save_or_show(fig, output_path)
+    return fig
+
+
+def plot_classification_accuracy(
+    eval_df: pd.DataFrame,
+    output_path: Optional[str] = None,
+) -> plt.Figure:
+    """
+    Per-quarter Spearman ρ between label rank and actual forward volatility.
+
+    X-axis : quarter_start dates
+    Y-axis : Spearman ρ in [-1, 1]
+    Horizontal dashed line at 0.  Bars are green when ρ > 0, red otherwise.
+
+    Parameters
+    ----------
+    eval_df : pd.DataFrame
+        Output of classify_assets() — evaluation DataFrame.
+        Must contain columns: quarter_start, risk_profile, actual_fwd_vol.
+    output_path : str, optional
+    """
+    from scipy.stats import spearmanr as _spearmanr
+    _ltr = {"conservative": 0, "balanced": 1, "aggressive": 2}
+
+    quarters = sorted(eval_df["quarter_start"].dropna().unique())
+    rho_vals: List[float] = []
+
+    for q in quarters:
+        q_data = eval_df[
+            (eval_df["quarter_start"] == q)
+            & eval_df["actual_fwd_vol"].notna()
+            & eval_df["risk_profile"].notna()
+        ].copy()
+        q_data["label_rank"] = q_data["risk_profile"].map(_ltr)
+        q_data = q_data.dropna(subset=["label_rank"])
+        if len(q_data) < 3:
+            rho_vals.append(np.nan)
+            continue
+        rho, _ = _spearmanr(q_data["label_rank"].values, q_data["actual_fwd_vol"].values)
+        rho_vals.append(float(rho) if np.isfinite(rho) else np.nan)
+
+    x      = np.arange(len(quarters))
+    colors = [
+        "#2ecc71" if (not np.isnan(v) and v > 0) else "#e74c3c"
+        for v in rho_vals
+    ]
+    bar_heights = [v if not np.isnan(v) else 0.0 for v in rho_vals]
+
+    fig, ax = plt.subplots(figsize=(max(10, len(quarters) * 1.2), 4))
+    sns.set_style("whitegrid")
+
+    ax.bar(x, bar_heights, color=colors, alpha=0.8, edgecolor="white")
+    ax.axhline(0, color="black", linewidth=1.0, linestyle="--", alpha=0.7)
+    ax.set_xticks(x)
+    ax.set_xticklabels(
+        [str(pd.Timestamp(q).date()) for q in quarters],
+        rotation=45, ha="right", fontsize=8,
+    )
+    ax.set_ylim(-1.1, 1.1)
+    ax.set_xlabel("Quarter Start", fontsize=12)
+    ax.set_ylabel("Spearman ρ", fontsize=12)
+    ax.set_title(
+        "Quarterly Classification Accuracy (Spearman ρ: label rank vs actual vol)",
+        fontsize=13, fontweight="bold",
+    )
+
+    fig.tight_layout()
+    save_or_show(fig, output_path)
+    return fig
+
+
 def plot_all(
     result_df: pd.DataFrame,
     output_dir: Optional[str] = None,
+    eval_df: Optional[pd.DataFrame] = None,
 ) -> None:
     """
     Render all plots.  If output_dir is set, save to that directory.
 
     Plots generated
     ---------------
-    vol_distribution.png       – volatility histogram by risk profile
-    cluster_assignments.png    – horizontal bar chart ranked by volatility
-    cluster_scatter.png        – 1-D jitter scatter of cluster separation
-    actual_risk_return.png     – actual vol vs actual return, coloured by profile
-    predicted_risk_return.png  – RL risk score vs actual return, coloured by profile
+    vol_distribution.png          – volatility histogram by risk profile
+    cluster_assignments.png       – horizontal bar chart ranked by volatility
+    cluster_scatter.png           – 1-D jitter scatter of cluster separation
+    actual_risk_return.png        – actual vol vs actual return, coloured by profile
+    predicted_risk_return.png     – RL risk score vs actual return, coloured by profile
+    rl_accuracy_scatter.png       – RL score vs actual fwd vol scatter (all windows)
+    rl_accuracy_timeseries.png    – per-stock time-series of RL score vs actual vol
+    quarterly_sharpe.png          – mean Sharpe per risk profile per quarter
+    classification_accuracy.png   – per-quarter Spearman ρ bar chart
     """
     def _path(name: str) -> Optional[str]:
         return f"{output_dir}/{name}" if output_dir else None
@@ -625,10 +779,9 @@ def plot_all(
 
     # RL accuracy plots — only if the dynamic files exist
     if output_dir:
-        import pandas as pd
-        from pathlib import Path
-        scores_path  = Path(output_dir) / "rl_dynamic_scores.csv"
-        fwd_vol_path = Path(output_dir) / "rl_dynamic_fwd_vol.csv"
+        from pathlib import Path as _Path
+        scores_path  = _Path(output_dir) / "rl_dynamic_scores.csv"
+        fwd_vol_path = _Path(output_dir) / "rl_dynamic_fwd_vol.csv"
         if scores_path.exists() and fwd_vol_path.exists():
             scores_df  = pd.read_csv(scores_path,  index_col=0, parse_dates=True)
             fwd_vol_df = pd.read_csv(fwd_vol_path, index_col=0, parse_dates=True)
@@ -640,3 +793,12 @@ def plot_all(
                 scores_df, fwd_vol_df, result_df,
                 output_path=_path("rl_accuracy_timeseries.png"),
             )
+
+    # Quarterly evaluation plots — only if eval_df is provided and non-empty
+    if eval_df is not None and not eval_df.empty:
+        plot_quarterly_sharpe(
+            eval_df, output_path=_path("quarterly_sharpe.png")
+        )
+        plot_classification_accuracy(
+            eval_df, output_path=_path("classification_accuracy.png")
+        )

@@ -543,3 +543,78 @@ class AssetSelectorEnv(gym.Env):
             np.where(ids == 1, "balanced", "conservative"),
         )
         return cluster_ids, risk_profiles
+
+    # ── Quarterly helpers ─────────────────────────────────────────────────────
+
+    def collect_quarterly_windows(self) -> List[Dict]:
+        """
+        Group rolling-window step indices into non-overlapping 63-day quarters.
+
+        The first quarter spans [_start_idx, _start_idx + 63), the second
+        [_start_idx + 63, _start_idx + 126), etc.  Because step_size=21 divides
+        63 evenly, every quarter boundary is also a valid step index.
+
+        Returns
+        -------
+        List of dicts, each containing:
+            quarter_start  : pd.Timestamp — date at quarter_idx in prices
+            quarter_idx    : int          — row index of the quarter's first window
+            window_indices : List[int]    — all step idx values in [q_start, q_start+63)
+        """
+        quarter_size = 63
+        quarters: List[Dict] = []
+
+        all_step_indices = list(range(self._start_idx, self._end_idx, self.step_size))
+        if not all_step_indices:
+            return quarters
+
+        q_num = 0
+        while True:
+            q_start_idx = self._start_idx + q_num * quarter_size
+            q_end_idx   = q_start_idx + quarter_size
+
+            if q_start_idx >= self._end_idx:
+                break
+
+            window_indices = [i for i in all_step_indices if q_start_idx <= i < q_end_idx]
+
+            if window_indices:
+                quarters.append({
+                    "quarter_start":  self.prices.index[q_start_idx],
+                    "quarter_idx":    q_start_idx,
+                    "window_indices": window_indices,
+                })
+
+            q_num += 1
+
+        return quarters
+
+    def compute_sharpe(self, idx: int, forward: int) -> np.ndarray:
+        """
+        Compute per-ticker annualised Sharpe ratio over log_returns[idx:idx+forward].
+
+        Sharpe = (mean_log_return × 252) / (std_log_return × √252)
+        Zero risk-free rate.  Returns NaN for tickers with fewer than 5 valid
+        log returns in the window.
+
+        Parameters
+        ----------
+        idx     : int — starting row index in the prices/log_returns DataFrame
+        forward : int — number of trading days to look forward
+
+        Returns
+        -------
+        np.ndarray shape (n_tickers,), dtype float64
+        """
+        fwd_end = min(idx + forward, len(self.prices))
+        fwd_ret = self.log_returns.iloc[idx:fwd_end]
+        results: List[float] = []
+        for t in self.tickers:
+            ret = fwd_ret[t].dropna()
+            if len(ret) < 5:
+                results.append(np.nan)
+                continue
+            mean_r = float(ret.mean() * TRADING_DAYS)
+            std_r  = float(ret.std()  * np.sqrt(TRADING_DAYS))
+            results.append(mean_r / std_r if std_r > 1e-8 else np.nan)
+        return np.array(results, dtype=np.float64)

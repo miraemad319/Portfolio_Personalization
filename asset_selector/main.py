@@ -161,7 +161,9 @@ def run_pipeline(
     Returns
     -------
     classification : pd.DataFrame
-        Columns: ticker | volatility | cluster_id | risk_profile
+        Static summary — columns: ticker | volatility | mean_return |
+        cluster_id | risk_profile | rl_risk_score
+        risk_profile is the dominant quarterly label.
     benchmarking_map : dict
         Always empty — historical EGX30 composition is not tracked here.
     """
@@ -192,17 +194,29 @@ def run_pipeline(
     logger.info("=" * 60)
     logger.info("Stage 3 / 4 — RL risk profiling")
     logger.info("=" * 60)
-    classification = classify_assets(
+    quarterly_df, eval_df, classification = classify_assets(
         prices,
         n_clusters=3,
         n_episodes=n_episodes,
         output_dir=output_dir,
     )
 
-    # Save classification table
+    # Save static classification table (dominant quarterly label per ticker)
     clf_path = out / "asset_classification.csv"
     classification.to_csv(clf_path, index=False)
     logger.info("Classification saved to %s", clf_path)
+
+    # quarterly_classifications.csv and evaluation.csv already saved by classify_assets
+    logger.info(
+        "Quarterly classifications: %d rows saved to %s",
+        len(quarterly_df),
+        out / "quarterly_classifications.csv",
+    )
+    logger.info(
+        "Evaluation results: %d rows saved to %s",
+        len(eval_df),
+        out / "evaluation.csv",
+    )
 
     # Save profile → tickers JSON (consumed by downstream portfolio models)
     profile_map = {
@@ -219,7 +233,7 @@ def run_pipeline(
         logger.info("=" * 60)
         logger.info("Stage 4 / 4 — Generating plots")
         logger.info("=" * 60)
-        plot_all(classification, output_dir=output_dir)
+        plot_all(classification, output_dir=output_dir, eval_df=eval_df)
 
     # ── Summary ────────────────────────────────────────────────────────────
     logger.info("=" * 60)

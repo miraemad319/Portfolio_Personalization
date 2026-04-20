@@ -44,11 +44,13 @@ Public API
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy.stats import spearmanr
 
 from asset_selector.rl_environment import AssetSelectorEnv
 from asset_selector.rl_agent import RLAssetSelectorAgent
@@ -70,10 +72,10 @@ def classify_assets(
     forward: int = 63,
     step_size: int = 21,
     output_dir: Optional[str] = None,
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Train an RL agent on rolling OHLCV windows then classify each ticker
-    into one of three risk profiles.
+    into one of three risk profiles, evaluated quarterly.
 
     Parameters
     ----------
@@ -93,17 +95,29 @@ def classify_assets(
         Days to advance between windows during training (~21 = 1 month).
     output_dir : str | None
         If given, saves:
-          • <output_dir>/rl_agent.pt           – trained model weights
-          • <output_dir>/rl_dynamic_scores.csv – per-window risk scores
-          • <output_dir>/rl_training_history.csv
+          • <output_dir>/rl_agent.pt                    – trained model weights
+          • <output_dir>/rl_dynamic_scores.csv          – per-window risk scores
+          • <output_dir>/rl_dynamic_fwd_vol.csv         – per-window forward vol
+          • <output_dir>/rl_training_history.csv        – training history
+          • <output_dir>/quarterly_classifications.csv  – quarterly labels
+          • <output_dir>/evaluation.csv                 – Sharpe/vol evaluation
 
     Returns
     -------
-    pd.DataFrame
+    quarterly_df : pd.DataFrame
+        Columns: quarter_start | ticker | rl_risk_score | risk_profile
+        One row per (quarter, ticker) for all RL-scored tickers.
+    eval_df : pd.DataFrame
+        Columns: quarter_start | ticker | risk_profile | actual_sharpe |
+                 actual_fwd_vol | classification_correct
+        classification_correct (float 0/1/NaN): whether the ticker's actual
+        forward volatility rank was consistent with its label tertile.
+    static_df : pd.DataFrame
         Columns: ticker | volatility | mean_return | cluster_id |
                  risk_profile | rl_risk_score
-        Sorted by volatility ascending.
-        Tickers excluded from RL (< 3 valid windows) receive risk_profile=None.
+        One row per ticker, sorted by volatility ascending.
+        risk_profile is the dominant (most frequent) quarterly label.
+        For use by the downstream visualiser.
     """
     if n_clusters != 3:
         raise ValueError("RL asset selector currently supports n_clusters=3 only.")
@@ -172,45 +186,187 @@ def classify_assets(
         "Training complete. Mean reward (last 10 episodes): %.4f", mean_reward
     )
 
-    # ── Inference: collect time-averaged risk scores and forward stats ───────
-    logger.info("Collecting risk scores and forward stats across all windows …")
+    # ── Inference 1: time-averaged scores (for dynamic files + static DF) ─────
+    logger.info("Collecting time-averaged risk scores and forward stats across all windows …")
     mean_scores, score_matrix, fwd_vol_matrix, fwd_ret_matrix = agent.collect_all_scores(env)
 
-    # ── Assign clusters ───────────────────────────────────────────────────────
-    cluster_ids, risk_profiles = env.assign_clusters(mean_scores)
+    # ── Inference 2: quarterly scores for dynamic classification + evaluation ─
+    logger.info("Collecting quarterly risk scores …")
+    quarterly_data = agent.collect_quarterly_scores(env)
 
-    # ── Build result DataFrame ────────────────────────────────────────────────
-    # Per-ticker mean forward vol/return across all windows — these are the
-    # exact quantities the RL model was trained to predict, so comparing
-    # rl_risk_score against them is a meaningful evaluation.
+    # ── Build quarterly_df ────────────────────────────────────────────────────
+    quarterly_rows: List[Dict] = []
+    for q_data in quarterly_data:
+        for i, ticker in enumerate(env.tickers):
+            score = q_data["mean_scores"][i]
+            rp    = q_data["risk_profiles"][i]
+            quarterly_rows.append({
+                "quarter_start":  q_data["quarter_start"],
+                "ticker":         ticker,
+                "rl_risk_score":  float(score) if np.isfinite(score) else np.nan,
+                "risk_profile":   rp if rp != "" else None,
+            })
+    quarterly_df = pd.DataFrame(quarterly_rows)
+
+    logger.info(
+        "Quarterly classifications: %d quarters × %d tickers = %d rows",
+        len(quarterly_data), env.n_tickers, len(quarterly_df),
+    )
+
+    # ── Build eval_df (actual Sharpe, forward vol, classification_correct) ────
+    eval_rows: List[Dict] = []
+    spearman_stats: List[Dict] = []
+    _label_to_rank = {"conservative": 0, "balanced": 1, "aggressive": 2}
+
+    for q_data in quarterly_data:
+        q_start       = q_data["quarter_start"]
+        q_idx         = q_data["quarter_idx"]
+        risk_profiles = q_data["risk_profiles"]   # (n_tickers,) str array
+
+        actual_sharpe  = env.compute_sharpe(q_idx, env.forward)           # (n_tickers,)
+        actual_fwd_vol = env._compute_forward_vol(q_idx)                   # (n_tickers,)
+
+        has_profile = np.array([rp != "" for rp in risk_profiles])
+        has_vol     = np.isfinite(actual_fwd_vol)
+        valid_mask  = has_profile & has_vol
+        n_valid     = int(valid_mask.sum())
+
+        # ── Per-quarter Spearman ρ ─────────────────────────────────────────
+        if n_valid >= 3:
+            label_ranks = np.array(
+                [_label_to_rank[risk_profiles[i]] for i in range(env.n_tickers) if valid_mask[i]],
+                dtype=float,
+            )
+            vol_vals = actual_fwd_vol[valid_mask]
+            rho_val, _ = spearmanr(label_ranks, vol_vals)
+            rho = float(rho_val) if np.isfinite(rho_val) else np.nan
+        else:
+            rho = np.nan
+
+        spearman_stats.append({
+            "quarter_start":    q_start,
+            "spearman_rho":     rho,
+            "n_valid_tickers":  n_valid,
+        })
+
+        # ── classification_correct (vol-rank tertile match) ────────────────
+        if n_valid >= 3:
+            valid_indices = np.where(valid_mask)[0]
+            vol_for_valid = actual_fwd_vol[valid_indices]
+            # Rank from 1 (lowest vol) to n_valid (highest vol)
+            vol_ranks_local = pd.Series(vol_for_valid).rank(method="average").values
+            third = n_valid / 3.0
+            rank_map: Dict[int, float] = {
+                int(valid_indices[j]): vol_ranks_local[j] for j in range(n_valid)
+            }
+
+            def _expected(rank: float) -> str:
+                if rank <= third:
+                    return "conservative"
+                elif rank <= 2 * third:
+                    return "balanced"
+                else:
+                    return "aggressive"
+        else:
+            rank_map = {}
+
+        for i, ticker in enumerate(env.tickers):
+            if valid_mask[i] and rank_map:
+                exp = _expected(rank_map[i])
+                correct: float = 1.0 if risk_profiles[i] == exp else 0.0
+            else:
+                correct = np.nan
+
+            eval_rows.append({
+                "quarter_start":          q_start,
+                "ticker":                 ticker,
+                "risk_profile":           risk_profiles[i] if risk_profiles[i] != "" else None,
+                "actual_sharpe":          float(actual_sharpe[i])  if np.isfinite(actual_sharpe[i])  else np.nan,
+                "actual_fwd_vol":         float(actual_fwd_vol[i]) if np.isfinite(actual_fwd_vol[i]) else np.nan,
+                "classification_correct": correct,
+            })
+
+    eval_df = pd.DataFrame(eval_rows)
+
+    # ── Summary statistics ────────────────────────────────────────────────────
+    logger.info("=" * 55)
+    logger.info("QUARTERLY CLASSIFICATION EVALUATION SUMMARY")
+    logger.info("=" * 55)
+    logger.info("Per-quarter Spearman ρ  (label rank vs actual forward vol):")
+    for row in spearman_stats:
+        rho_str = f"{row['spearman_rho']:.3f}" if np.isfinite(row["spearman_rho"]) else "N/A"
+        logger.info(
+            "  %s  n_tickers=%2d  Spearman ρ = %s",
+            row["quarter_start"].strftime("%Y-%m-%d"),
+            row["n_valid_tickers"],
+            rho_str,
+        )
+
+    rho_vals = [r["spearman_rho"] for r in spearman_stats if np.isfinite(r["spearman_rho"])]
+    if rho_vals:
+        logger.info(
+            "Spearman ρ across all quarters:  mean=%.3f  std=%.3f  (n=%d quarters)",
+            float(np.mean(rho_vals)), float(np.std(rho_vals)), len(rho_vals),
+        )
+
+    logger.info("Mean actual Sharpe and forward vol per risk profile (all quarters):")
+    for profile in ("conservative", "balanced", "aggressive"):
+        grp = eval_df[eval_df["risk_profile"] == profile]
+        if not grp.empty:
+            logger.info(
+                "  %-12s: mean_sharpe=%+.3f  mean_fwd_vol=%.3f",
+                profile,
+                float(grp["actual_sharpe"].mean()),
+                float(grp["actual_fwd_vol"].mean()),
+            )
+
+    valid_correct = eval_df["classification_correct"].dropna()
+    if not valid_correct.empty:
+        logger.info(
+            "Overall classification accuracy (vol-rank tertile): %.1f%%",
+            float(valid_correct.mean()) * 100,
+        )
+
+    # ── Build static_df (backward-compat with visualiser) ─────────────────────
+    # risk_profile = dominant (most-frequent) quarterly label per ticker.
     scored_arr = np.array(sorted(data_tickers))   # matches env.tickers order
+
+    ticker_to_quarterly_profiles: Dict[str, List[str]] = {t: [] for t in env.tickers}
+    for q_data in quarterly_data:
+        for i, t in enumerate(env.tickers):
+            rp = q_data["risk_profiles"][i]
+            if rp != "":
+                ticker_to_quarterly_profiles[t].append(rp)
+
+    _profile_to_id = {"conservative": 0, "balanced": 1, "aggressive": 2}
+    dominant_cluster_ids   = np.full(env.n_tickers, -1,  dtype=int)
+    dominant_risk_profiles = np.full(env.n_tickers, "",  dtype=object)
+
+    for i, t in enumerate(env.tickers):
+        profiles = ticker_to_quarterly_profiles[t]
+        if profiles:
+            dominant = Counter(profiles).most_common(1)[0][0]
+            dominant_risk_profiles[i] = dominant
+            dominant_cluster_ids[i]   = _profile_to_id[dominant]
+
     vol_values = np.nanmean(fwd_vol_matrix, axis=0)   # (n_tickers,)
     ret_values = np.nanmean(fwd_ret_matrix, axis=0)   # (n_tickers,)
 
-    # Sort scored tickers by volatility ascending
     sort_order           = np.argsort(np.where(np.isfinite(vol_values), vol_values, np.inf))
     tickers_sorted       = scored_arr[sort_order]
     vol_sorted           = vol_values[sort_order]
     ret_sorted           = ret_values[sort_order]
-    cluster_ids_sorted   = cluster_ids[sort_order]
-    risk_profiles_sorted = risk_profiles[sort_order]
+    cluster_ids_sorted   = dominant_cluster_ids[sort_order]
+    risk_profiles_sorted = dominant_risk_profiles[sort_order]
     mean_scores_sorted   = mean_scores[sort_order]
 
-    risk_profile_final: List[Optional[str]] = [
-        rp if rp != "" else None for rp in risk_profiles_sorted
-    ]
-    cluster_id_final: List[Optional[int]] = [
-        int(cid) if cid != -1 else None for cid in cluster_ids_sorted
-    ]
+    static_df = pd.DataFrame({"ticker": tickers_sorted})
+    static_df["volatility"]    = vol_sorted
+    static_df["mean_return"]   = ret_sorted
+    static_df["cluster_id"]    = [int(c) if c != -1 else None for c in cluster_ids_sorted]
+    static_df["risk_profile"]  = [rp if rp != "" else None for rp in risk_profiles_sorted]
+    static_df["rl_risk_score"] = mean_scores_sorted
 
-    result = pd.DataFrame({"ticker": tickers_sorted})
-    result["volatility"]    = vol_sorted
-    result["mean_return"]   = ret_sorted
-    result["cluster_id"]    = cluster_id_final
-    result["risk_profile"]  = risk_profile_final
-    result["rl_risk_score"] = mean_scores_sorted
-
-    # ── Append no-data tickers with risk_profile=None ─────────────────────────
     if no_data_tickers:
         nd_rows = pd.DataFrame({"ticker": no_data_tickers})
         nd_rows["volatility"]    = np.nan
@@ -218,13 +374,13 @@ def classify_assets(
         nd_rows["cluster_id"]    = None
         nd_rows["risk_profile"]  = None
         nd_rows["rl_risk_score"] = np.nan
-        result = pd.concat([result, nd_rows], ignore_index=True)
+        static_df = pd.concat([static_df, nd_rows], ignore_index=True)
 
-    result = result.reset_index(drop=True)
+    static_df = static_df.reset_index(drop=True)
 
-    # ── Logging summary ───────────────────────────────────────────────────────
+    # ── Logging summary (static view) ─────────────────────────────────────────
     for profile in ("conservative", "balanced", "aggressive"):
-        grp = result[result["risk_profile"] == profile]
+        grp = static_df[static_df["risk_profile"] == profile]
         if not grp.empty:
             logger.info(
                 "  %-12s: %2d tickers  vol [%.3f, %.3f]  "
@@ -235,12 +391,12 @@ def classify_assets(
                 grp["rl_risk_score"].min(), grp["rl_risk_score"].max(),
             )
 
-    unclassified = result["risk_profile"].isna().sum()
+    unclassified = static_df["risk_profile"].isna().sum()
     if unclassified:
         logger.warning(
             "%d tickers unclassified (insufficient data windows): %s",
             unclassified,
-            result.loc[result["risk_profile"].isna(), "ticker"].tolist(),
+            static_df.loc[static_df["risk_profile"].isna(), "ticker"].tolist(),
         )
 
     # ── Optional outputs ──────────────────────────────────────────────────────
@@ -265,14 +421,13 @@ def classify_assets(
         dynamic_df.to_csv(dynamic_path)
         logger.info("Dynamic risk scores saved to %s", dynamic_path)
 
-        # Forward realized volatility matrix (actual vol the RL was trained to predict)
-        fwd_vol_df = pd.DataFrame(
+        fwd_vol_file = pd.DataFrame(
             fwd_vol_matrix,
             index   = window_dates[: len(fwd_vol_matrix)],
             columns = sorted(data_tickers),
         )
         fwd_vol_path = out / "rl_dynamic_fwd_vol.csv"
-        fwd_vol_df.to_csv(fwd_vol_path)
+        fwd_vol_file.to_csv(fwd_vol_path)
         logger.info("Dynamic forward vol saved to %s", fwd_vol_path)
 
         # Training history
@@ -281,7 +436,26 @@ def classify_assets(
         history_df.to_csv(history_path, index=False)
         logger.info("Training history saved to %s", history_path)
 
-    return result
+        # Quarterly classifications
+        q_path = out / "quarterly_classifications.csv"
+        quarterly_df.to_csv(q_path, index=False)
+        logger.info("Quarterly classifications saved to %s", q_path)
+
+        # Evaluation results
+        e_path = out / "evaluation.csv"
+        eval_df.to_csv(e_path, index=False)
+        logger.info("Evaluation results saved to %s", e_path)
+
+        # Per-quarter Spearman summary
+        spearman_df = pd.DataFrame(spearman_stats)
+        if rho_vals:
+            spearman_df.attrs["mean_spearman"] = float(np.mean(rho_vals))
+            spearman_df.attrs["std_spearman"]  = float(np.std(rho_vals))
+        spearman_path = out / "quarterly_spearman.csv"
+        spearman_df.to_csv(spearman_path, index=False)
+        logger.info("Per-quarter Spearman saved to %s", spearman_path)
+
+    return quarterly_df, eval_df, static_df
 
 
 def get_profile_tickers(

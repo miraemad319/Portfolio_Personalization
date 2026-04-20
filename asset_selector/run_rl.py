@@ -46,16 +46,29 @@ def run_rl_only(
     prices = pd.read_parquet(out / "prices.parquet")
 
     logger.info("Running RL classification (%d episodes) ...", n_episodes)
-    classification = classify_assets(
+    quarterly_df, eval_df, classification = classify_assets(
         prices,
         n_clusters=3,
         n_episodes=n_episodes,
         output_dir=output_dir,
     )
 
+    # Static summary (dominant quarterly label per ticker)
     clf_path = out / "asset_classification.csv"
     classification.to_csv(clf_path, index=False)
     logger.info("Classification saved to %s", clf_path)
+
+    # quarterly_classifications.csv and evaluation.csv already saved by classify_assets
+    logger.info(
+        "Quarterly classifications: %d rows saved to %s",
+        len(quarterly_df),
+        out / "quarterly_classifications.csv",
+    )
+    logger.info(
+        "Evaluation results: %d rows saved to %s",
+        len(eval_df),
+        out / "evaluation.csv",
+    )
 
     profile_map = {
         p: get_profile_tickers(classification, p)
@@ -68,7 +81,7 @@ def run_rl_only(
     logger.info("Risk profiles saved to %s", json_path)
 
     if generate_plots:
-        plot_all(classification, output_dir=output_dir)
+        plot_all(classification, output_dir=output_dir, eval_df=eval_df)
 
     for p in ("conservative", "balanced", "aggressive"):
         tickers = profile_map[p]

@@ -571,6 +571,62 @@ class RLAssetSelectorAgent:
 
         return mean_scores, score_matrix, fwd_vol_matrix, fwd_ret_matrix
 
+    def collect_quarterly_scores(self, env) -> List[Dict]:
+        """
+        Run deterministic inference grouped into non-overlapping 63-day quarters.
+
+        For each quarter returned by env.collect_quarterly_windows(), collects
+        RL risk scores for every window in that quarter using predict_mean_scores(),
+        nanmean-averages them across windows (masking tickers with no data), then
+        calls env.assign_clusters() to get conservative/balanced/aggressive labels.
+
+        Parameters
+        ----------
+        env : AssetSelectorEnv
+
+        Returns
+        -------
+        List of dicts, one per quarter:
+            quarter_start : pd.Timestamp
+            quarter_idx   : int
+            mean_scores   : np.ndarray (n_tickers,)  — quarterly-averaged RL scores
+            risk_profiles : np.ndarray (n_tickers,)  — label strings (''/invalid)
+            cluster_ids   : np.ndarray (n_tickers,)  — 0/1/2, or -1 for invalid
+        """
+        quarters = env.collect_quarterly_windows()
+        result: List[Dict] = []
+
+        for q in quarters:
+            scores_in_q: List[np.ndarray] = []
+
+            for idx in q["window_indices"]:
+                obs    = env._get_observation(idx)
+                valid  = env._get_valid_mask(idx)
+                scores = self.predict_mean_scores(obs).astype(np.float64)
+                scores[~valid] = np.nan
+                scores_in_q.append(scores)
+
+            if not scores_in_q:
+                continue
+
+            score_arr   = np.stack(scores_in_q, axis=0)      # (w, n_tickers)
+            mean_scores = np.nanmean(score_arr, axis=0)       # (n_tickers,)
+            # Require at least one valid window per ticker
+            mean_scores[np.isfinite(score_arr).sum(axis=0) < 1] = np.nan
+
+            cluster_ids, risk_profiles = env.assign_clusters(mean_scores)
+
+            result.append({
+                "quarter_start":  q["quarter_start"],
+                "quarter_idx":    q["quarter_idx"],
+                "mean_scores":    mean_scores,
+                "risk_profiles":  risk_profiles,
+                "cluster_ids":    cluster_ids,
+            })
+
+        logger.info("Quarterly scoring complete: %d quarters", len(result))
+        return result
+
     # ── Persistence ───────────────────────────────────────────────────────────
 
     def save(self, path: str | Path) -> None:
