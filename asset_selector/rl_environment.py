@@ -72,22 +72,7 @@ def _window_features(
     ret_window: pd.DataFrame,
     px_window: pd.DataFrame,
 ) -> np.ndarray:
-    """
-    Compute a (n_tickers, 11) feature matrix for one time window.
-
-    Parameters
-    ----------
-    ret_window : pd.DataFrame
-        Daily log returns for the lookback window.
-        DatetimeIndex, columns = tickers.
-    px_window : pd.DataFrame
-        Close prices for the same window.
-
-    Returns
-    -------
-    np.ndarray, shape (n_tickers, 11), dtype float32.
-        NaN where a ticker has insufficient data.
-    """
+    
     n_features = len(FEATURE_NAMES)
     tickers = ret_window.columns.tolist()
 
@@ -224,6 +209,7 @@ class AssetSelectorEnv(gym.Env):
         forward: int = 63,
         step_size: int = 21,
         n_clusters: int = 3,
+        train_end_idx: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -241,9 +227,17 @@ class AssetSelectorEnv(gym.Env):
             self.prices / self.prices.shift(1)
         )
 
-        # Valid step range
-        self._start_idx = lookback
-        self._end_idx   = len(prices) - forward - 1
+        # Valid step range across the full dataset (used during inference)
+        self._start_idx    = lookback
+        self._full_end_idx = len(prices) - forward - 1
+
+        if train_end_idx is not None:
+            # Cap training to [_start_idx, train_end_idx); test starts here
+            self._end_idx        = min(int(train_end_idx), self._full_end_idx)
+            self._test_start_idx: Optional[int] = self._end_idx
+        else:
+            self._end_idx        = self._full_end_idx
+            self._test_start_idx = None
 
         if self._end_idx <= self._start_idx:
             raise ValueError(
@@ -439,17 +433,30 @@ class AssetSelectorEnv(gym.Env):
 
     # ── Inference helpers ─────────────────────────────────────────────────────
 
-    def iter_all_windows(self):
+    def iter_all_windows(
+        self,
+        start_idx: Optional[int] = None,
+        end_idx: Optional[int] = None,
+    ):
         """
-        Iterate through every valid window in chronological order.
+        Iterate through valid windows in chronological order.
+
+        Parameters
+        ----------
+        start_idx : int | None
+            First window index (inclusive). Defaults to self._start_idx.
+        end_idx : int | None
+            Last window index (exclusive). Defaults to self._end_idx.
 
         Yields
         ------
         (date: pd.Timestamp, obs: np.ndarray, idx: int, valid_mask: np.ndarray)
             valid_mask is bool (n_tickers,) — True where ticker had real data.
         """
-        idx = self._start_idx
-        while idx < self._end_idx:
+        idx_s = start_idx if start_idx is not None else self._start_idx
+        idx_e = end_idx   if end_idx   is not None else self._end_idx
+        idx   = idx_s
+        while idx < idx_e:
             yield (
                 self.prices.index[idx],
                 self._get_observation(idx),
@@ -546,13 +553,23 @@ class AssetSelectorEnv(gym.Env):
 
     # ── Quarterly helpers ─────────────────────────────────────────────────────
 
-    def collect_quarterly_windows(self) -> List[Dict]:
+    def collect_quarterly_windows(
+        self,
+        start_idx: Optional[int] = None,
+        end_idx: Optional[int] = None,
+    ) -> List[Dict]:
         """
         Group rolling-window step indices into non-overlapping 63-day quarters.
 
-        The first quarter spans [_start_idx, _start_idx + 63), the second
-        [_start_idx + 63, _start_idx + 126), etc.  Because step_size=21 divides
-        63 evenly, every quarter boundary is also a valid step index.
+        Quarters are built relative to ``start_idx`` so that both the training
+        and test period produce a self-contained, gapless sequence of quarters.
+
+        Parameters
+        ----------
+        start_idx : int | None
+            First window index. Defaults to self._start_idx.
+        end_idx : int | None
+            One-past-last window index. Defaults to self._end_idx.
 
         Returns
         -------
@@ -561,19 +578,22 @@ class AssetSelectorEnv(gym.Env):
             quarter_idx    : int          — row index of the quarter's first window
             window_indices : List[int]    — all step idx values in [q_start, q_start+63)
         """
+        idx_s = start_idx if start_idx is not None else self._start_idx
+        idx_e = end_idx   if end_idx   is not None else self._end_idx
+
         quarter_size = 63
         quarters: List[Dict] = []
 
-        all_step_indices = list(range(self._start_idx, self._end_idx, self.step_size))
+        all_step_indices = list(range(idx_s, idx_e, self.step_size))
         if not all_step_indices:
             return quarters
 
         q_num = 0
         while True:
-            q_start_idx = self._start_idx + q_num * quarter_size
+            q_start_idx = idx_s + q_num * quarter_size
             q_end_idx   = q_start_idx + quarter_size
 
-            if q_start_idx >= self._end_idx:
+            if q_start_idx >= idx_e:
                 break
 
             window_indices = [i for i in all_step_indices if q_start_idx <= i < q_end_idx]

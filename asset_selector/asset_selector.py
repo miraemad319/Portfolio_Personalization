@@ -72,6 +72,7 @@ def classify_assets(
     forward: int = 63,
     step_size: int = 21,
     output_dir: Optional[str] = None,
+    train_end: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Train an RL agent on rolling OHLCV windows then classify each ticker
@@ -101,6 +102,14 @@ def classify_assets(
           • <output_dir>/rl_training_history.csv        – training history
           • <output_dir>/quarterly_classifications.csv  – quarterly labels
           • <output_dir>/evaluation.csv                 – Sharpe/vol evaluation
+    train_end : str | None
+        ISO date string (e.g. "2022-12-31") for a temporal train/test split.
+        Windows whose lookback ends at or before this date are used for
+        training (pre-training + PPO).  Windows after this date are held out
+        as a test set: the agent runs inference on them but never trains on
+        them.  quarterly_df and eval_df gain a ``split`` column ("train" /
+        "test").  When None (default) the full dataset is used for training
+        (backward-compatible behaviour).
 
     Returns
     -------
@@ -155,13 +164,33 @@ def classify_assets(
         lookback, forward, step_size, n_episodes,
     )
 
+    # ── Temporal train/test split ─────────────────────────────────────────────
+    train_end_idx: Optional[int] = None
+    if train_end is not None:
+        split_ts  = pd.Timestamp(train_end)
+        split_pos = prices_aligned.index.searchsorted(split_ts, side="right") - 1
+        if 0 <= split_pos < len(prices_aligned):
+            train_end_idx = int(split_pos)
+            train_date    = prices_aligned.index[train_end_idx].strftime("%Y-%m-%d")
+            test_start_pos = min(train_end_idx + 1, len(prices_aligned) - 1)
+            test_date      = prices_aligned.index[test_start_pos].strftime("%Y-%m-%d")
+            logger.info(
+                "Temporal split: TRAIN through %s (row %d) | TEST from %s onward",
+                train_date, train_end_idx, test_date,
+            )
+        else:
+            logger.warning(
+                "train_end %s is outside the price data range — ignoring split.", train_end
+            )
+
     # ── Build environment ─────────────────────────────────────────────────────
     env = AssetSelectorEnv(
-        prices    = prices_aligned,
-        lookback  = lookback,
-        forward   = forward,
-        step_size = step_size,
-        n_clusters= n_clusters,
+        prices        = prices_aligned,
+        lookback      = lookback,
+        forward       = forward,
+        step_size     = step_size,
+        n_clusters    = n_clusters,
+        train_end_idx = train_end_idx,
     )
 
     # ── Build agent ───────────────────────────────────────────────────────────
@@ -186,13 +215,56 @@ def classify_assets(
         "Training complete. Mean reward (last 10 episodes): %.4f", mean_reward
     )
 
-    # ── Inference 1: time-averaged scores (for dynamic files + static DF) ─────
-    logger.info("Collecting time-averaged risk scores and forward stats across all windows …")
-    mean_scores, score_matrix, fwd_vol_matrix, fwd_ret_matrix = agent.collect_all_scores(env)
+    # ── Inference 1: per-window scores (train period) ─────────────────────────
+    logger.info("Collecting risk scores on TRAIN windows …")
+    (train_mean_scores,
+     train_score_matrix,
+     train_fwd_vol_matrix,
+     train_fwd_ret_matrix) = agent.collect_all_scores(
+        env, start_idx=env._start_idx, end_idx=env._end_idx
+    )
 
-    # ── Inference 2: quarterly scores for dynamic classification + evaluation ─
-    logger.info("Collecting quarterly risk scores …")
-    quarterly_data = agent.collect_quarterly_scores(env)
+    # ── Inference 1b: per-window scores (test period, if split set) ───────────
+    if env._test_start_idx is not None and env._test_start_idx < env._full_end_idx:
+        logger.info("Collecting risk scores on TEST windows (held-out) …")
+        (test_mean_scores,
+         test_score_matrix,
+         test_fwd_vol_matrix,
+         test_fwd_ret_matrix) = agent.collect_all_scores(
+            env, start_idx=env._test_start_idx, end_idx=env._full_end_idx
+        )
+        # Combine for dynamic CSV outputs and static_df aggregation
+        score_matrix   = np.concatenate([train_score_matrix,   test_score_matrix],   axis=0)
+        fwd_vol_matrix = np.concatenate([train_fwd_vol_matrix, test_fwd_vol_matrix], axis=0)
+        fwd_ret_matrix = np.concatenate([train_fwd_ret_matrix, test_fwd_ret_matrix], axis=0)
+        mean_scores    = np.nanmean(score_matrix, axis=0)
+        valid_counts   = np.isfinite(score_matrix).sum(axis=0)
+        mean_scores[valid_counts < 3] = np.nan
+    else:
+        score_matrix   = train_score_matrix
+        fwd_vol_matrix = train_fwd_vol_matrix
+        fwd_ret_matrix = train_fwd_ret_matrix
+        mean_scores    = train_mean_scores
+
+    # ── Inference 2: quarterly scores (train + test separately) ──────────────
+    logger.info("Collecting quarterly risk scores (TRAIN) …")
+    train_quarterly = agent.collect_quarterly_scores(
+        env, start_idx=env._start_idx, end_idx=env._end_idx
+    )
+    for q in train_quarterly:
+        q["split"] = "train"
+
+    if env._test_start_idx is not None and env._test_start_idx < env._full_end_idx:
+        logger.info("Collecting quarterly risk scores (TEST) …")
+        test_quarterly = agent.collect_quarterly_scores(
+            env, start_idx=env._test_start_idx, end_idx=env._full_end_idx
+        )
+        for q in test_quarterly:
+            q["split"] = "test"
+    else:
+        test_quarterly = []
+
+    quarterly_data = train_quarterly + test_quarterly
 
     # ── Build quarterly_df ────────────────────────────────────────────────────
     quarterly_rows: List[Dict] = []
@@ -205,6 +277,7 @@ def classify_assets(
                 "ticker":         ticker,
                 "rl_risk_score":  float(score) if np.isfinite(score) else np.nan,
                 "risk_profile":   rp if rp != "" else None,
+                "split":          q_data.get("split", "train"),
             })
     quarterly_df = pd.DataFrame(quarterly_rows)
 
@@ -247,6 +320,7 @@ def classify_assets(
             "quarter_start":    q_start,
             "spearman_rho":     rho,
             "n_valid_tickers":  n_valid,
+            "split":            q_data.get("split", "train"),
         })
 
         # ── classification_correct (vol-rank tertile match) ────────────────
@@ -284,6 +358,7 @@ def classify_assets(
                 "actual_sharpe":          float(actual_sharpe[i])  if np.isfinite(actual_sharpe[i])  else np.nan,
                 "actual_fwd_vol":         float(actual_fwd_vol[i]) if np.isfinite(actual_fwd_vol[i]) else np.nan,
                 "classification_correct": correct,
+                "split":                  q_data.get("split", "train"),
             })
 
     eval_df = pd.DataFrame(eval_rows)
@@ -309,6 +384,25 @@ def classify_assets(
             float(np.mean(rho_vals)), float(np.std(rho_vals)), len(rho_vals),
         )
 
+    train_rhos = [
+        r["spearman_rho"] for r in spearman_stats
+        if r.get("split") == "train" and np.isfinite(r["spearman_rho"])
+    ]
+    test_rhos = [
+        r["spearman_rho"] for r in spearman_stats
+        if r.get("split") == "test" and np.isfinite(r["spearman_rho"])
+    ]
+    if train_rhos:
+        logger.info(
+            "  TRAIN Spearman ρ: mean=%.3f  std=%.3f  (n=%d quarters)",
+            float(np.mean(train_rhos)), float(np.std(train_rhos)), len(train_rhos),
+        )
+    if test_rhos:
+        logger.info(
+            "  TEST  Spearman ρ: mean=%.3f  std=%.3f  (n=%d quarters)  ← held-out",
+            float(np.mean(test_rhos)), float(np.std(test_rhos)), len(test_rhos),
+        )
+
     logger.info("Mean actual Sharpe and forward vol per risk profile (all quarters):")
     for profile in ("conservative", "balanced", "aggressive"):
         grp = eval_df[eval_df["risk_profile"] == profile]
@@ -326,6 +420,14 @@ def classify_assets(
             "Overall classification accuracy (vol-rank tertile): %.1f%%",
             float(valid_correct.mean()) * 100,
         )
+    if "split" in eval_df.columns:
+        for sp in ("train", "test"):
+            sp_correct = eval_df.loc[eval_df["split"] == sp, "classification_correct"].dropna()
+            if not sp_correct.empty:
+                label = "TRAIN" if sp == "train" else "TEST (held-out)"
+                logger.info(
+                    "  %s accuracy: %.1f%%", label, float(sp_correct.mean()) * 100
+                )
 
     # ── Build static_df (backward-compat with visualiser) ─────────────────────
     # risk_profile = dominant (most-frequent) quarterly label per ticker.
@@ -407,10 +509,10 @@ def classify_assets(
         # Model weights
         agent.save(out / "rl_agent.pt")
 
-        # Dynamic per-window scores and forward vols
+        # Dynamic per-window scores and forward vols (full range: train + test)
         window_dates = [
             env.prices.index[min(i, len(env.prices) - 1)]
-            for i in range(env._start_idx, env._end_idx, env.step_size)
+            for i in range(env._start_idx, env._full_end_idx, env.step_size)
         ]
         dynamic_df = pd.DataFrame(
             score_matrix,

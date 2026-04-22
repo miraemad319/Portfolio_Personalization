@@ -527,12 +527,21 @@ class RLAssetSelectorAgent:
         return mean.cpu().numpy()
 
     def collect_all_scores(
-        self, env
+        self,
+        env,
+        start_idx: Optional[int] = None,
+        end_idx: Optional[int] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
-        Deterministic pass over every window → time-averaged scores and
-        the corresponding forward realised vol / return that the model was
-        trained to predict.
+        Deterministic pass over windows in [start_idx, end_idx) → time-averaged
+        scores and the corresponding forward realised vol / return.
+
+        Parameters
+        ----------
+        start_idx : int | None
+            First window index. Defaults to env._start_idx.
+        end_idx : int | None
+            One-past-last window index. Defaults to env._end_idx.
 
         Returns
         -------
@@ -545,7 +554,7 @@ class RLAssetSelectorAgent:
         all_fwd_vols:  List[np.ndarray] = []
         all_fwd_rets:  List[np.ndarray] = []
 
-        for _date, obs, idx, valid_mask in env.iter_all_windows():
+        for _date, obs, idx, valid_mask in env.iter_all_windows(start_idx=start_idx, end_idx=end_idx):
             scores = self.predict_mean_scores(obs).astype(np.float64)
             # Set score to NaN for tickers that had no data in this window.
             # Without this, the actor's constant ~0.485 output for all-zero obs
@@ -571,7 +580,12 @@ class RLAssetSelectorAgent:
 
         return mean_scores, score_matrix, fwd_vol_matrix, fwd_ret_matrix
 
-    def collect_quarterly_scores(self, env) -> List[Dict]:
+    def collect_quarterly_scores(
+        self,
+        env,
+        start_idx: Optional[int] = None,
+        end_idx: Optional[int] = None,
+    ) -> List[Dict]:
         """
         Run deterministic inference grouped into non-overlapping 63-day quarters.
 
@@ -583,6 +597,10 @@ class RLAssetSelectorAgent:
         Parameters
         ----------
         env : AssetSelectorEnv
+        start_idx : int | None
+            First window index. Defaults to env._start_idx.
+        end_idx : int | None
+            One-past-last window index. Defaults to env._end_idx.
 
         Returns
         -------
@@ -593,7 +611,7 @@ class RLAssetSelectorAgent:
             risk_profiles : np.ndarray (n_tickers,)  — label strings (''/invalid)
             cluster_ids   : np.ndarray (n_tickers,)  — 0/1/2, or -1 for invalid
         """
-        quarters = env.collect_quarterly_windows()
+        quarters = env.collect_quarterly_windows(start_idx=start_idx, end_idx=end_idx)
         result: List[Dict] = []
 
         for q in quarters:

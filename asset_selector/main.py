@@ -154,6 +154,7 @@ def run_pipeline(
     start: date = date(2020, 1, 1),
     end: date = date(2025, 12, 31),
     prices_dir: Optional[str] = None,
+    train_end: str = "2024-12-31",
 ) -> tuple[pd.DataFrame, dict]:
     """
     Execute the full EGX30 Asset Selector pipeline.
@@ -199,6 +200,7 @@ def run_pipeline(
         n_clusters=3,
         n_episodes=n_episodes,
         output_dir=output_dir,
+        train_end=train_end,
     )
 
     # Save static classification table (dominant quarterly label per ticker)
@@ -283,13 +285,25 @@ def _cli() -> None:
         metavar="N",
         help="RL training episodes (default: 60; 150 recommended for best convergence)",
     )
+    parser.add_argument(
+        "--train-end",
+        default="2024-12-31",
+        metavar="DATE",
+        help=(
+            "ISO date marking the end of the training period (default: 2022-12-31). "
+            "Windows after this date are held out as a test set. "
+            "Pass 'none' to disable the split and train on all data."
+        ),
+    )
     args = parser.parse_args()
 
+    train_end_arg = None if args.train_end.lower() == "none" else args.train_end
     run_pipeline(
         output_dir=args.output_dir,
         generate_plots=not args.no_plots,
         n_episodes=args.n_episodes,
         prices_dir=args.prices_dir,
+        train_end=train_end_arg,
     )
 
 

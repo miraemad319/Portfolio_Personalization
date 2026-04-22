@@ -39,6 +39,7 @@ def run_rl_only(
     output_dir: str = "asset_selector/output",
     n_episodes: int = 150,
     generate_plots: bool = True,
+    train_end: str = "2024-12-31",
 ) -> pd.DataFrame:
     out = Path(output_dir)
 
@@ -51,6 +52,7 @@ def run_rl_only(
         n_clusters=3,
         n_episodes=n_episodes,
         output_dir=output_dir,
+        train_end=train_end,
     )
 
     # Static summary (dominant quarterly label per ticker)
@@ -95,10 +97,16 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", default="asset_selector/output", metavar="DIR")
     parser.add_argument("--n-episodes", type=int, default=150, metavar="N")
     parser.add_argument("--no-plots", action="store_true")
+    parser.add_argument(
+        "--train-end", default="2024-12-31", metavar="DATE",
+        help="End of training period (default: 2024-12-31). Pass 'none' to disable split.",
+    )
     args = parser.parse_args()
 
+    train_end_arg = None if args.train_end.lower() == "none" else args.train_end
     run_rl_only(
         output_dir=args.output_dir,
         n_episodes=args.n_episodes,
         generate_plots=not args.no_plots,
+        train_end=train_end_arg,
     )
