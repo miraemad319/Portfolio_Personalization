@@ -530,17 +530,21 @@ class RLAssetSelectorAgent:
     def collect_quarterly_scores(
         self,
         env,
-        start_idx: Optional[int] = None,
-        end_idx:   Optional[int] = None,
+        start_idx:  Optional[int]                  = None,
+        end_idx:    Optional[int]                  = None,
+        thresholds: Optional[Tuple[float, float]]  = None,
     ) -> List[Dict]:
         """
         Deterministic inference grouped into non-overlapping 63-day quarters.
 
-        For each quarter, scores are averaged across the ~3 windows within
-        it, invalid tickers are masked to NaN, and assign_clusters() is
-        called to produce conservative/balanced/aggressive labels.
+        Parameters
+        env        : AssetSelectorEnv
+        start_idx  : int | None
+        end_idx    : int | None
+        thresholds : (t_low, t_high) | None
+            Fixed score thresholds derived from training data.
+            Passed through to env.assign_clusters() for every quarter.
         """
-
         quarters = env.collect_quarterly_windows(
             start_idx=start_idx, end_idx=end_idx
         )
@@ -559,13 +563,13 @@ class RLAssetSelectorAgent:
             if not scores_in_q:
                 continue
 
-            score_arr   = np.stack(scores_in_q, axis=0)   # (w, n_tickers)
-            mean_scores = np.nanmean(score_arr, axis=0)    # (n_tickers,)
-
-            # Require at least 1 valid window per ticker in this quarter
+            score_arr   = np.stack(scores_in_q, axis=0)
+            mean_scores = np.nanmean(score_arr, axis=0)
             mean_scores[np.isfinite(score_arr).sum(axis=0) < 1] = np.nan
 
-            cluster_ids, risk_profiles = env.assign_clusters(mean_scores)
+            cluster_ids, risk_profiles = env.assign_clusters(
+                mean_scores, thresholds=thresholds
+            )
 
             result.append({
                 "quarter_start":  q["quarter_start"],

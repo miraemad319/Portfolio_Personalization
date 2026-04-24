@@ -177,12 +177,33 @@ def classify_assets(
         fwd_ret_matrix = train_fwd_ret_matrix
         mean_scores    = train_mean_scores
 
+    # Compute classification thresholds from training scores:
+    # Use the 33rd and 67th percentile of all valid training window scores
+    # as fixed cut points. Derived purely from training data and applied
+    # consistently to both train and test quarters
+    train_scores_flat = train_score_matrix[np.isfinite(train_score_matrix)]
+    if len(train_scores_flat) < 10:
+        raise ValueError(
+            "Too few valid training scores to compute thresholds. "
+            "Check that the training period contains sufficient data."
+        )
+    t_low  = float(np.percentile(train_scores_flat, 33.3))
+    t_high = float(np.percentile(train_scores_flat, 66.7))
+    thresholds = (t_low, t_high)
+    logger.info(
+        "Classification thresholds (from training score distribution): "
+        "t_low=%.4f  t_high=%.4f",
+        t_low, t_high,
+    )
+
     # Inference — quarterly classifications 
     logger.info("Quarterly inference on TRAIN windows …")
     train_quarterly = agent.collect_quarterly_scores(
         env,
         start_idx = env._start_idx,
         end_idx   = env._end_idx,
+        thresholds = thresholds,
+        
     )
     for q in train_quarterly:
         q["split"] = "train"
@@ -193,6 +214,7 @@ def classify_assets(
             env,
             start_idx = env._test_start_idx,
             end_idx   = env._full_end_idx,
+            thresholds = thresholds,
         )
         for q in test_quarterly:
             q["split"] = "test"

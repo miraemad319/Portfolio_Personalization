@@ -475,17 +475,15 @@ class AssetSelectorEnv(gym.Env):
     def assign_clusters(
         self,
         mean_risk_scores: np.ndarray,
+        thresholds: Optional[Tuple[float, float]] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Map per-ticker mean risk scores → cluster IDs and profile strings.
-
-        Scores are cross-sectionally standardised before gap-search so that
-        compressed actor outputs (common early in training or with a narrow
-        score range) still produce meaningful cluster boundaries.
+        Map per-ticker mean risk scores to cluster IDs and profile strings.
 
             cluster 0 → 'conservative'
             cluster 1 → 'balanced'
             cluster 2 → 'aggressive'
+
         """
         cluster_ids   = np.full(self.n_tickers, -1, dtype=int)
         risk_profiles = np.full(self.n_tickers, "",  dtype=object)
@@ -493,62 +491,41 @@ class AssetSelectorEnv(gym.Env):
         valid = np.isfinite(mean_risk_scores)
         if valid.sum() < self.n_clusters:
             logger.warning(
-                "Only %d valid scores; cannot form %d clusters — "
-                "all tickers left unclassified for this window.",
+                "Only %d valid scores; cannot form %d clusters.",
                 valid.sum(), self.n_clusters,
             )
             return cluster_ids, risk_profiles
 
         scores = mean_risk_scores[valid]
-        n      = len(scores)
 
-        # Standardise scores to zero mean and unit std before gap-search.
-        # This ensures the gap-search operates on a consistent scale
-        # regardless of how compressed the raw actor outputs are.
-        # The standardisation is purely for boundary-finding — the original
-        # scores are preserved in mean_risk_scores for all downstream uses.
-        s_std = scores.std()
-        if s_std > 1e-8:
-            scores_normed = (scores - scores.mean()) / s_std
+        if thresholds is not None:
+            t_low, t_high = thresholds
         else:
-            # All scores identical — fall straight through to tertile split
-            scores_normed = scores.copy()
+            # Fallback only — callers should always supply thresholds
+            logger.warning(
+                "assign_clusters called without thresholds "
+                "falling back to tertile split of current scores. "
+                "This should only happen during testing or debugging."
+            )
+            t_low, t_high = float(np.percentile(scores, 33.3)), \
+                            float(np.percentile(scores, 66.7))
 
-        min_size      = max(2, n // 10)
-        sorted_normed = np.sort(scores_normed)
-        gaps          = np.diff(sorted_normed)
-
-        best_t1, best_t2, best_gap_sum = None, None, -np.inf
-        for i in range(min_size - 1, n - min_size - 1):
-            for j in range(i + min_size, n - 1):
-                gap_sum = gaps[i] + gaps[j]
-                if gap_sum > best_gap_sum:
-                    best_gap_sum = gap_sum
-                    best_t1 = (sorted_normed[i]     + sorted_normed[i + 1]) / 2
-                    best_t2 = (sorted_normed[j]     + sorted_normed[j + 1]) / 2
-
-        ids_candidate = np.where(
-            scores_normed > best_t2, 2,
-            np.where(scores_normed > best_t1, 1, 0),
+        ids = np.where(
+            scores >= t_high, 2,
+            np.where(scores >= t_low, 1, 0),
         )
 
-        cluster_sizes = np.bincount(ids_candidate, minlength=3)
-        if cluster_sizes.max() > 0.55 * n:
-            logger.warning(
-                "Gap-search produced imbalanced clusters %s (>55%% in one bin). "
-                "Falling back to tertile split.",
-                cluster_sizes.tolist(),
-            )
-            q33, q67 = np.percentile(sorted_normed, [33.3, 66.7])
-            best_t1, best_t2 = float(q33), float(q67)
-            ids_candidate = np.where(
-                scores_normed > best_t2, 2,
-                np.where(scores_normed > best_t1, 1, 0),
-            )
+        # Log the resulting distribution so imbalances are visible
+        counts = np.bincount(ids, minlength=3)
+        logger.debug(
+            "assign_clusters: conservative=%d  balanced=%d  aggressive=%d  "
+            "(thresholds: %.4f / %.4f)",
+            counts[0], counts[1], counts[2], t_low, t_high,
+        )
 
-        cluster_ids[valid]   = ids_candidate
+        cluster_ids[valid]   = ids
         risk_profiles[valid] = np.where(
-            ids_candidate == 2, "aggressive",
-            np.where(ids_candidate == 1, "balanced", "conservative"),
+            ids == 2, "aggressive",
+            np.where(ids == 1, "balanced", "conservative"),
         )
         return cluster_ids, risk_profiles
