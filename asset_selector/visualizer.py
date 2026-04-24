@@ -1,60 +1,63 @@
 """
 visualizer.py
-=============
-Visualisation utilities for the EGX30 Asset Selector pipeline.
 
-Functions
----------
-plot_volatility_distribution(result_df, output_path=None)
-    Histogram of annualised realised volatility, colour-coded by risk profile.
+Plots generated
 
-plot_cluster_assignments(result_df, output_path=None)
-    Horizontal bar chart of tickers ranked by volatility with colour bands.
+1. cluster_assignments.png
+       Horizontal bar chart — one bar per ticker ranked by mean forward
+       volatility, coloured by current risk profile.  The primary "what
+       did the model decide" plot.
 
-plot_cluster_scatter(result_df, output_path=None)
-    Scatter plot (1-D projection) showing cluster separation.
+2. actual_risk_return.png
+       Scatter: actual mean forward volatility (x) vs actual mean forward
+       return (y), coloured by current risk profile.  Shows whether the
+       three tiers are genuinely separated in risk-return space.
 
-plot_actual_risk_return(result_df, output_path=None)
-    Risk-return scatter: actual annualised volatility (x) vs actual
-    annualised return (y), coloured by RL-assigned risk profile.
+3. rl_accuracy_scatter.png
+       Scatter: RL risk score (x) vs actual forward volatility (y) for
+       every (window, ticker) pair across the full dataset.  The best-fit
+       line and Spearman ρ show how well the model's continuous score
+       tracks real risk.  Train and test points are plotted in different
+       shades to make the held-out period visible.
 
-plot_predicted_risk_return(result_df, output_path=None)
-    Risk-return scatter: RL risk score (x, the model's predicted risk rank)
-    vs actual annualised return (y), coloured by risk profile.  Illustrates
-    how the model's risk ordering aligns with realised return outcomes.
+4. classification_accuracy.png
+       Bar chart — per-quarter Spearman ρ between label rank and actual
+       forward volatility.  Green = positive (correct ordering), red =
+       negative (inverted).  Train quarters and test quarters are
+       visually distinguished.  This is the primary model evaluation plot.
 
-plot_quarterly_sharpe(eval_df, output_path=None)
-    Grouped bar chart of mean actual Sharpe per risk profile per quarter.
-
-plot_classification_accuracy(eval_df, output_path=None)
-    Per-quarter Spearman ρ between label rank and actual forward volatility.
-
-save_or_show(fig, output_path)
-    Save to file if path is given, otherwise display interactively.
+5. quarterly_sharpe.png
+       Grouped bar chart — mean actual Sharpe per risk profile per quarter.
+       Shows whether conservative / balanced / aggressive buckets had
+       meaningfully different risk-adjusted returns in reality.
+       Train and test quarters are separated by a vertical divider.
 """
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
-import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from scipy.stats import spearmanr
 
 logger = logging.getLogger(__name__)
 
-# Colour palette for the three risk profiles
 PROFILE_COLOURS: dict[str, str] = {
-    "conservative": "#2ecc71",   # green
-    "balanced":     "#f39c12",   # orange
-    "aggressive":   "#e74c3c",   # red
+    "conservative": "#2ecc71",
+    "balanced":     "#f39c12",
+    "aggressive":   "#e74c3c",
 }
 PROFILE_ORDER = ["conservative", "balanced", "aggressive"]
 
+# Train / test shading
+TRAIN_ALPHA = 0.55
+TEST_ALPHA  = 0.90
 
 def _legend_patches() -> list[mpatches.Patch]:
     return [
@@ -62,11 +65,9 @@ def _legend_patches() -> list[mpatches.Patch]:
         for p in PROFILE_ORDER
     ]
 
-
-def save_or_show(fig: plt.Figure, output_path: Optional[str]) -> None:
-    if output_path:
-        path = Path(output_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+def _save(fig: plt.Figure, path: Optional[str]) -> None:
+    if path:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(path, dpi=150, bbox_inches="tight")
         logger.info("Plot saved to %s", path)
         plt.close(fig)
@@ -74,169 +75,59 @@ def save_or_show(fig: plt.Figure, output_path: Optional[str]) -> None:
         plt.show()
 
 
-def plot_volatility_distribution(
-    result_df: pd.DataFrame,
-    output_path: Optional[str] = None,
-) -> plt.Figure:
-    """
-    Histogram of annualised realised volatility, colour-coded by risk profile.
+def _path(output_dir: Optional[str], name: str) -> Optional[str]:
+    return f"{output_dir}/{name}" if output_dir else None
 
-    Parameters
-    ----------
-    result_df : pd.DataFrame
-        Output of asset_selector.classify_assets().
-    output_path : str, optional
-        If given, save the figure to this path instead of displaying it.
-    """
-    fig, ax = plt.subplots(figsize=(10, 5))
-    sns.set_style("whitegrid")
-
-    valid = result_df.dropna(subset=["volatility", "risk_profile"])
-    bins = np.linspace(valid["volatility"].min() * 0.9, valid["volatility"].max() * 1.1, 20)
-
-    for profile in PROFILE_ORDER:
-        grp = valid[valid["risk_profile"] == profile]["volatility"]
-        if grp.empty:
-            continue
-        ax.hist(
-            grp,
-            bins=bins,
-            color=PROFILE_COLOURS[profile],
-            alpha=0.7,
-            label=profile.capitalize(),
-            edgecolor="white",
-            linewidth=0.5,
-        )
-
-    ax.set_xlabel("Mean Forward 63-Day Annualised Volatility", fontsize=12)
-    ax.set_ylabel("Number of Tickers", fontsize=12)
-    ax.set_title("EGX30 Forward Volatility Distribution by Risk Profile", fontsize=14, fontweight="bold")
-    ax.legend(handles=_legend_patches(), fontsize=10)
-    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0%}"))
-
-    fig.tight_layout()
-    save_or_show(fig, output_path)
-    return fig
-
+# Plot 1 — Cluster assignments
 
 def plot_cluster_assignments(
-    result_df: pd.DataFrame,
+    result_df:   pd.DataFrame,
     output_path: Optional[str] = None,
 ) -> plt.Figure:
-    """
-    Horizontal bar chart: one bar per ticker, ranked by volatility,
-    coloured by risk profile.
-    """
     valid = (
         result_df.dropna(subset=["volatility", "risk_profile"])
         .sort_values("volatility")
         .reset_index(drop=True)
     )
 
-    fig, ax = plt.subplots(figsize=(12, max(6, len(valid) * 0.3)))
+    fig, ax = plt.subplots(figsize=(12, max(6, len(valid) * 0.32)))
     sns.set_style("whitegrid")
 
     colours = valid["risk_profile"].map(PROFILE_COLOURS).fillna("#95a5a6")
-    bars = ax.barh(valid["ticker"], valid["volatility"], color=colours, edgecolor="white")
+    bars    = ax.barh(
+        valid["ticker"], valid["volatility"],
+        color=colours, edgecolor="white", linewidth=0.4,
+    )
 
-    # Annotate values
     for bar, vol in zip(bars, valid["volatility"]):
         ax.text(
-            bar.get_width() + 0.002,
+            bar.get_width() + 0.003,
             bar.get_y() + bar.get_height() / 2,
             f"{vol:.1%}",
-            va="center",
-            ha="left",
-            fontsize=8,
+            va="center", ha="left", fontsize=7.5,
         )
 
     ax.set_xlabel("Mean Forward 63-Day Annualised Volatility", fontsize=12)
-    ax.set_title("EGX30 Ticker Risk Classification", fontsize=14, fontweight="bold")
-    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0%}"))
+    ax.set_title(
+        "EGX30 Risk Classification — Current Labels\n"
+        "(volatility = mean across all scored quarters)",
+        fontsize=13, fontweight="bold",
+    )
+    ax.xaxis.set_major_formatter(
+        plt.FuncFormatter(lambda x, _: f"{x:.0%}")
+    )
     ax.legend(handles=_legend_patches(), loc="lower right", fontsize=10)
 
     fig.tight_layout()
-    save_or_show(fig, output_path)
+    _save(fig, output_path)
     return fig
 
-
-def plot_cluster_scatter(
-    result_df: pd.DataFrame,
-    output_path: Optional[str] = None,
-) -> plt.Figure:
-    """
-    1-D scatter plot (jittered) showing cluster separation along the
-    volatility axis.
-    """
-    valid = result_df.dropna(subset=["volatility", "risk_profile"])
-
-    fig, ax = plt.subplots(figsize=(12, 4))
-    sns.set_style("whitegrid")
-
-    rng = np.random.default_rng(0)
-    for profile in PROFILE_ORDER:
-        grp = valid[valid["risk_profile"] == profile]
-        if grp.empty:
-            continue
-        jitter = rng.uniform(-0.15, 0.15, size=len(grp))
-        ax.scatter(
-            grp["volatility"],
-            jitter,
-            color=PROFILE_COLOURS[profile],
-            label=profile.capitalize(),
-            s=80,
-            alpha=0.85,
-            edgecolors="white",
-            linewidths=0.5,
-            zorder=3,
-        )
-        # Label ticker symbols
-        for _, row in grp.iterrows():
-            ax.annotate(
-                row["ticker"],
-                (row["volatility"], jitter[grp.index.get_loc(row.name)]),
-                fontsize=6,
-                ha="center",
-                va="bottom",
-                xytext=(0, 6),
-                textcoords="offset points",
-                color=PROFILE_COLOURS[profile],
-            )
-
-    ax.set_xlabel("Mean Forward 63-Day Annualised Volatility", fontsize=12)
-    ax.set_yticks([])
-    ax.set_title("EGX30 Risk Cluster Scatter", fontsize=14, fontweight="bold")
-    ax.legend(handles=_legend_patches(), fontsize=10)
-    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0%}"))
-
-    fig.tight_layout()
-    save_or_show(fig, output_path)
-    return fig
-
+# Plot 2 — Actual risk-return scatter
 
 def plot_actual_risk_return(
-    result_df: pd.DataFrame,
+    result_df:   pd.DataFrame,
     output_path: Optional[str] = None,
 ) -> plt.Figure:
-    """
-    Risk-return scatter using actual (realised) values.
-
-    X-axis : mean forward 63-day annualised volatility, averaged across all
-             rolling windows  (the actual risk the RL model was trained to predict)
-    Y-axis : mean forward 63-day annualised return, averaged across all windows
-    Colour : RL-assigned risk profile
-
-    Each point is labelled with its ticker symbol.  A horizontal zero-return
-    line is drawn for reference.
-
-    Parameters
-    ----------
-    result_df : pd.DataFrame
-        Output of asset_selector.classify_assets().
-        Must contain columns: ticker, volatility, mean_return, risk_profile.
-    output_path : str, optional
-        If given, save the figure to this path instead of displaying it.
-    """
     valid = result_df.dropna(subset=["volatility", "mean_return", "risk_profile"])
 
     fig, ax = plt.subplots(figsize=(11, 7))
@@ -249,460 +140,163 @@ def plot_actual_risk_return(
         ax.scatter(
             grp["volatility"],
             grp["mean_return"],
-            color=PROFILE_COLOURS[profile],
-            label=profile.capitalize(),
-            s=90,
-            alpha=0.85,
-            edgecolors="white",
-            linewidths=0.6,
-            zorder=3,
+            color      = PROFILE_COLOURS[profile],
+            label      = profile.capitalize(),
+            s          = 90,
+            alpha      = 0.85,
+            edgecolors = "white",
+            linewidths = 0.6,
+            zorder     = 3,
         )
         for _, row in grp.iterrows():
             ax.annotate(
                 row["ticker"],
                 (row["volatility"], row["mean_return"]),
-                fontsize=7,
-                ha="left",
-                va="bottom",
-                xytext=(4, 3),
-                textcoords="offset points",
-                color=PROFILE_COLOURS[profile],
+                fontsize   = 7,
+                ha         = "center",
+                va         = "bottom",
+                xytext     = (0, 5),
+                textcoords = "offset points",
+                color      = PROFILE_COLOURS[profile],
             )
 
-    ax.axhline(0, color="grey", linewidth=0.8, linestyle="--", alpha=0.6)
-
-    ax.set_xlabel("Mean Forward 63-Day Volatility (Actual Risk)", fontsize=12)
-    ax.set_ylabel("Mean Forward 63-Day Return (Actual Return)", fontsize=12)
+    ax.axhline(0, color="grey", linewidth=0.8, linestyle="--", alpha=0.5)
+    ax.set_xlabel("Mean Forward 63-Day Annualised Volatility", fontsize=12)
+    ax.set_ylabel("Mean Forward 63-Day Annualised Return",     fontsize=12)
     ax.set_title(
-        "Actual Forward Risk-Return by RL Risk Profile",
-        fontsize=14, fontweight="bold",
-    )
-    ax.legend(handles=_legend_patches(), fontsize=10)
-    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0%}"))
-    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0%}"))
-
-    fig.tight_layout()
-    save_or_show(fig, output_path)
-    return fig
-
-
-def plot_predicted_risk_return(
-    result_df: pd.DataFrame,
-    output_path: Optional[str] = None,
-) -> plt.Figure:
-    """
-    RL predicted risk vs actual return scatter.
-
-    X-axis : RL risk score (model's predicted risk ranking, higher = riskier)
-    Y-axis : mean forward 63-day annualised return, averaged across all windows
-    Colour : RL-assigned risk profile
-
-    This plot evaluates whether the RL model's risk ordering aligns with the
-    realised forward risk-return tradeoff.  Both axes are averaged over the
-    same rolling windows used during training, so the comparison is consistent:
-    stocks with higher predicted risk should cluster toward higher forward
-    volatility and potentially more dispersed forward returns.
-
-    Parameters
-    ----------
-    result_df : pd.DataFrame
-        Output of asset_selector.classify_assets().
-        Must contain columns: ticker, rl_risk_score, mean_return, risk_profile.
-    output_path : str, optional
-        If given, save the figure to this path instead of displaying it.
-    """
-    valid = result_df.dropna(subset=["rl_risk_score", "mean_return", "risk_profile"])
-
-    fig, ax = plt.subplots(figsize=(11, 7))
-    sns.set_style("whitegrid")
-
-    for profile in PROFILE_ORDER:
-        grp = valid[valid["risk_profile"] == profile]
-        if grp.empty:
-            continue
-        ax.scatter(
-            grp["rl_risk_score"],
-            grp["mean_return"],
-            color=PROFILE_COLOURS[profile],
-            label=profile.capitalize(),
-            s=90,
-            alpha=0.85,
-            edgecolors="white",
-            linewidths=0.6,
-            zorder=3,
-        )
-        for _, row in grp.iterrows():
-            ax.annotate(
-                row["ticker"],
-                (row["rl_risk_score"], row["mean_return"]),
-                fontsize=7,
-                ha="left",
-                va="bottom",
-                xytext=(4, 3),
-                textcoords="offset points",
-                color=PROFILE_COLOURS[profile],
-            )
-
-    ax.axhline(0, color="grey", linewidth=0.8, linestyle="--", alpha=0.6)
-
-    ax.set_xlabel("RL Risk Score (Predicted Risk)", fontsize=12)
-    ax.set_ylabel("Mean Forward 63-Day Return (Actual Return)", fontsize=12)
-    ax.set_title(
-        "RL Predicted Risk vs Actual Forward Return",
-        fontsize=14, fontweight="bold",
-    )
-    ax.legend(handles=_legend_patches(), fontsize=10)
-    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0%}"))
-
-    fig.tight_layout()
-    save_or_show(fig, output_path)
-    return fig
-
-
-def plot_rl_vs_actual_vol_scatter(
-    scores_df: pd.DataFrame,
-    fwd_vol_df: pd.DataFrame,
-    result_df: pd.DataFrame,
-    output_path: Optional[str] = None,
-) -> plt.Figure:
-    """
-    Scatter plot of RL risk score (x) vs actual forward realised volatility (y)
-    across all rolling windows and all tickers.
-
-    Each dot is one (ticker, window) observation.  If the RL model is correct,
-    higher scores should map to higher realised forward volatility — we expect
-    a positive slope.  The Spearman correlation is shown in the title.
-
-    Parameters
-    ----------
-    scores_df  : pd.DataFrame  — rl_dynamic_scores.csv  (windows × tickers)
-    fwd_vol_df : pd.DataFrame  — rl_dynamic_fwd_vol.csv (windows × tickers)
-    result_df  : pd.DataFrame  — asset_classification.csv
-    output_path : str, optional
-    """
-    from scipy.stats import spearmanr
-
-    profile_map = (
-        result_df.dropna(subset=["risk_profile"])
-        .set_index("ticker")["risk_profile"]
-        .to_dict()
-    )
-
-    all_scores, all_vols, all_profiles = [], [], []
-
-    for ticker in scores_df.columns:
-        if ticker not in fwd_vol_df.columns:
-            continue
-        s = scores_df[ticker].dropna().values
-        v = fwd_vol_df[ticker].dropna().values
-        # Align by index (same windows)
-        s_idx = scores_df[ticker].dropna().index
-        v_idx = fwd_vol_df[ticker].dropna().index
-        common = s_idx.intersection(v_idx)
-        if len(common) < 3:
-            continue
-        s_vals = scores_df.loc[common, ticker].values
-        v_vals = fwd_vol_df.loc[common, ticker].values
-        all_scores.extend(s_vals)
-        all_vols.extend(v_vals)
-        all_profiles.extend([profile_map.get(ticker, "balanced")] * len(common))
-
-    all_scores  = np.array(all_scores)
-    all_vols    = np.array(all_vols)
-    all_profiles = np.array(all_profiles)
-
-    rho, _ = spearmanr(all_scores, all_vols)
-
-    fig, ax = plt.subplots(figsize=(10, 7))
-    sns.set_style("whitegrid")
-
-    for profile in PROFILE_ORDER:
-        mask = all_profiles == profile
-        if mask.sum() == 0:
-            continue
-        ax.scatter(
-            all_scores[mask],
-            all_vols[mask],
-            color   = PROFILE_COLOURS[profile],
-            label   = profile.capitalize(),
-            s       = 18,
-            alpha   = 0.45,
-            edgecolors = "none",
-        )
-
-    # Best-fit line
-    m, b = np.polyfit(all_scores, all_vols, 1)
-    x_line = np.linspace(all_scores.min(), all_scores.max(), 100)
-    ax.plot(x_line, m * x_line + b, color="black", linewidth=1.5,
-            linestyle="--", label="Best-fit line")
-
-    ax.set_xlabel("RL Risk Score (model's predicted risk)", fontsize=12)
-    ax.set_ylabel("Actual Forward 63-Day Realised Volatility", fontsize=12)
-    ax.set_title(
-        f"RL Predicted Risk vs Actual Forward Volatility\n"
-        f"(all windows × all tickers)   Spearman ρ = {rho:.3f}",
+        "Actual Risk-Return by Risk Profile\n"
+        "(values averaged across all scored quarters)",
         fontsize=13, fontweight="bold",
     )
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0%}"))
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0%}"))
-    ax.legend(handles=_legend_patches() + [
-        plt.Line2D([0], [0], color="black", linestyle="--", linewidth=1.5,
-                   label="Best-fit line")
-    ], fontsize=10)
+    ax.legend(handles=_legend_patches(), fontsize=10)
 
     fig.tight_layout()
-    save_or_show(fig, output_path)
+    _save(fig, output_path)
     return fig
 
+# Plot 3 — RL score vs actual forward volatility scatter
 
-def plot_rl_vs_actual_vol_timeseries(
-    scores_df: pd.DataFrame,
-    fwd_vol_df: pd.DataFrame,
-    result_df: pd.DataFrame,
-    n_per_bucket: int = 3,
+def plot_rl_accuracy_scatter(
+    scores_df:   pd.DataFrame,
+    fwd_vol_df:  pd.DataFrame,
+    result_df:   pd.DataFrame,
     output_path: Optional[str] = None,
 ) -> plt.Figure:
-    """
-    Grid of per-ticker time-series plots: RL risk score vs actual forward vol.
-
-    Selects n_per_bucket representative stocks from each risk profile and
-    plots two lines for each:
-      • Orange/solid  — RL risk score (right Y-axis, normalised to [0,1])
-      • Blue/dashed   — Actual forward realised volatility (left Y-axis, %)
-
-    If the model is correct, the two lines should rise and fall together.
-
-    Parameters
-    ----------
-    scores_df     : pd.DataFrame  — rl_dynamic_scores.csv
-    fwd_vol_df    : pd.DataFrame  — rl_dynamic_fwd_vol.csv
-    result_df     : pd.DataFrame  — asset_classification.csv
-    n_per_bucket  : int           — stocks sampled per risk profile (default 3)
-    output_path   : str, optional
-    """
-    # Pick representative tickers: median-vol stock from each profile
-    picks: list[str] = []
-    for profile in PROFILE_ORDER:
-        grp = (
-            result_df[result_df["risk_profile"] == profile]
-            .dropna(subset=["volatility"])
-            .sort_values("volatility")
-        )
-        if grp.empty:
-            continue
-        # Spread across low / mid / high within the profile
-        indices = np.linspace(0, len(grp) - 1, min(n_per_bucket, len(grp)), dtype=int)
-        picks.extend(grp.iloc[indices]["ticker"].tolist())
-
-    n_plots = len(picks)
-    n_cols  = n_per_bucket
-    n_rows  = len(PROFILE_ORDER)
-
-    fig, axes = plt.subplots(
-        n_rows, n_cols,
-        figsize=(5 * n_cols, 3.5 * n_rows),
-        constrained_layout=True,
-    )
-    axes = np.array(axes).reshape(n_rows, n_cols)
-
-    profile_order_map = {p: i for i, p in enumerate(PROFILE_ORDER)}
-
     ticker_profile = (
         result_df.dropna(subset=["risk_profile"])
         .set_index("ticker")["risk_profile"]
         .to_dict()
     )
 
-    for ticker in picks:
-        profile = ticker_profile.get(ticker, "balanced")
-        row     = profile_order_map[profile]
+    # Identify the train/test boundary from the index
+    all_dates  = scores_df.index.sort_values()
+    split_date = None
 
-        # find column slot within this row
-        col = next(
-            (j for j in range(n_cols)
-             if axes[row, j].get_title() == ""),
-            None,
-        )
-        if col is None:
-            continue
+    # Try to infer split from a gap larger than 2× the typical step
+    if len(all_dates) > 2:
+        diffs = np.diff(all_dates.astype(np.int64))
+        median_diff = np.median(diffs)
+        gap_idx = np.where(diffs > 2 * median_diff)[0]
+        if len(gap_idx) > 0:
+            split_date = all_dates[gap_idx[0] + 1]
 
-        ax = axes[row, col]
+    all_scores:   list[float] = []
+    all_vols:     list[float] = []
+    all_profiles: list[str]   = []
+    all_splits:   list[str]   = []
 
-        if ticker not in scores_df.columns or ticker not in fwd_vol_df.columns:
-            ax.set_visible(False)
-            continue
-
-        s = scores_df[ticker].dropna()
-        v = fwd_vol_df[ticker].dropna()
-        common = s.index.intersection(v.index)
-        if len(common) < 3:
-            ax.set_visible(False)
-            continue
-
-        s_vals = s.loc[common]
-        v_vals = v.loc[common]
-
-        # Normalise RL score to [0, 1] so both lines fit on a readable scale
-        s_min, s_max = s_vals.min(), s_vals.max()
-        s_norm = (s_vals - s_min) / (s_max - s_min + 1e-8)
-
-        colour = PROFILE_COLOURS[profile]
-
-        ax2 = ax.twinx()
-        ax.plot(
-            common, v_vals * 100,
-            color="steelblue", linewidth=1.8, linestyle="--",
-            label="Actual fwd vol (%)",
-        )
-        ax2.plot(
-            common, s_norm,
-            color=colour, linewidth=1.8, linestyle="-",
-            label="RL score (normalised)",
-        )
-
-        ax.set_title(f"{ticker}  [{profile}]", fontsize=10,
-                     color=colour, fontweight="bold")
-        ax.set_ylabel("Actual Vol (%)", fontsize=8, color="steelblue")
-        ax2.set_ylabel("RL Score (0–1)", fontsize=8, color=colour)
-        ax.tick_params(axis="y", labelcolor="steelblue", labelsize=7)
-        ax2.tick_params(axis="y", labelcolor=colour, labelsize=7)
-        ax.tick_params(axis="x", labelsize=7, rotation=30)
-        ax2.set_ylim(-0.05, 1.05)
-
-    # Hide any unused axes
-    for r in range(n_rows):
-        for c in range(n_cols):
-            if axes[r, c].get_title() == "":
-                axes[r, c].set_visible(False)
-
-    # Row labels
-    for profile, row_idx in profile_order_map.items():
-        fig.text(
-            0.01, 1 - (row_idx + 0.5) / n_rows,
-            profile.upper(),
-            va="center", ha="left",
-            fontsize=11, fontweight="bold",
-            color=PROFILE_COLOURS[profile],
-            rotation=90,
-        )
-
-    # Shared legend
-    handles = [
-        plt.Line2D([0], [0], color="steelblue", linestyle="--",
-                   linewidth=1.8, label="Actual forward vol"),
-        plt.Line2D([0], [0], color="grey", linestyle="-",
-                   linewidth=1.8, label="RL risk score (norm. 0–1)"),
+    common_tickers = [
+        t for t in scores_df.columns
+        if t in fwd_vol_df.columns and t in ticker_profile
     ]
-    fig.legend(handles=handles, loc="lower center",
-               ncol=2, fontsize=10, bbox_to_anchor=(0.5, -0.02))
 
-    fig.suptitle(
-        "RL Risk Score vs Actual Forward Volatility — Per Stock Time Series\n"
-        "(lines moving together = model tracking real risk correctly)",
-        fontsize=13, fontweight="bold", y=1.01,
-    )
+    for date in all_dates:
+        if date not in fwd_vol_df.index:
+            continue
+        split = (
+            "test"
+            if split_date is not None and date >= split_date
+            else "train"
+        )
+        for t in common_tickers:
+            s = scores_df.loc[date, t]
+            v = fwd_vol_df.loc[date, t]
+            if pd.isna(s) or pd.isna(v):
+                continue
+            all_scores.append(float(s))
+            all_vols.append(float(v))
+            all_profiles.append(ticker_profile[t])
+            all_splits.append(split)
 
-    save_or_show(fig, output_path)
-    return fig
-
-
-def plot_quarterly_sharpe(
-    eval_df: pd.DataFrame,
-    output_path: Optional[str] = None,
-) -> plt.Figure:
-    """
-    Grouped bar chart of mean actual Sharpe ratio per risk profile per quarter.
-
-    X-axis : quarter_start dates
-    Y-axis : mean actual Sharpe ratio
-    Three bar groups per quarter: conservative (green), balanced (orange),
-    aggressive (red).
-
-    Parameters
-    ----------
-    eval_df : pd.DataFrame
-        Output of classify_assets() — evaluation DataFrame.
-        Must contain columns: quarter_start, risk_profile, actual_sharpe.
-    output_path : str, optional
-    """
-    grp = (
-        eval_df.dropna(subset=["actual_sharpe", "risk_profile"])
-        .groupby(["quarter_start", "risk_profile"])["actual_sharpe"]
-        .mean()
-        .reset_index()
-    )
-
-    if grp.empty:
-        logger.warning("plot_quarterly_sharpe: no data available — skipping")
+    if not all_scores:
+        logger.warning("plot_rl_accuracy_scatter: no data — skipping.")
         fig, ax = plt.subplots()
         ax.set_title("No data")
-        save_or_show(fig, output_path)
+        _save(fig, output_path)
         return fig
 
-    quarters = sorted(grp["quarter_start"].unique())
-    x        = np.arange(len(quarters))
-    width    = 0.25
+    all_scores_arr   = np.array(all_scores)
+    all_vols_arr     = np.array(all_vols)
+    all_profiles_arr = np.array(all_profiles)
+    all_splits_arr   = np.array(all_splits)
 
-    fig, ax = plt.subplots(figsize=(max(10, len(quarters) * 1.2), 5))
+    rho, _ = spearmanr(all_scores_arr, all_vols_arr)
+
+    fig, ax = plt.subplots(figsize=(10, 7))
     sns.set_style("whitegrid")
 
-    for offset, profile in enumerate(PROFILE_ORDER):
-        pgrp = grp[grp["risk_profile"] == profile]
-        vals = []
-        for q in quarters:
-            row = pgrp[pgrp["quarter_start"] == q]
-            vals.append(float(row["actual_sharpe"].values[0]) if not row.empty else 0.0)
-        ax.bar(
-            x + (offset - 1) * width,
-            vals,
-            width=width,
-            color=PROFILE_COLOURS[profile],
-            alpha=0.85,
-            label=profile.capitalize(),
-            edgecolor="white",
-        )
+    for profile in PROFILE_ORDER:
+        for split, alpha in [("train", TRAIN_ALPHA), ("test", TEST_ALPHA)]:
+            mask = (all_profiles_arr == profile) & (all_splits_arr == split)
+            if mask.sum() == 0:
+                continue
+            label = f"{profile.capitalize()} ({'test' if split == 'test' else 'train'})"
+            ax.scatter(
+                all_scores_arr[mask],
+                all_vols_arr[mask],
+                color      = PROFILE_COLOURS[profile],
+                alpha      = alpha,
+                s          = 14,
+                edgecolors = "none",
+                label      = label,
+            )
 
-    ax.axhline(0, color="grey", linewidth=0.8, linestyle="--", alpha=0.6)
-    ax.set_xticks(x)
-    ax.set_xticklabels(
-        [str(pd.Timestamp(q).date()) for q in quarters],
-        rotation=45, ha="right", fontsize=8,
+    # Best-fit line
+    m, b    = np.polyfit(all_scores_arr, all_vols_arr, 1)
+    x_line  = np.linspace(all_scores_arr.min(), all_scores_arr.max(), 200)
+    ax.plot(
+        x_line, m * x_line + b,
+        color="black", linewidth=1.6, linestyle="--",
+        label="Best-fit line",
     )
-    ax.set_xlabel("Quarter Start", fontsize=12)
-    ax.set_ylabel("Mean Actual Sharpe Ratio", fontsize=12)
+
+    ax.set_xlabel("RL Risk Score (model output)",          fontsize=12)
+    ax.set_ylabel("Actual Forward 63-Day Realised Vol",    fontsize=12)
     ax.set_title(
-        "Quarterly Mean Sharpe by Risk Profile — Evaluation",
-        fontsize=14, fontweight="bold",
+        f"RL Predicted Risk vs Actual Forward Volatility\n"
+        f"All windows × all tickers   |   Spearman ρ = {rho:.3f}",
+        fontsize=13, fontweight="bold",
     )
-    ax.legend(handles=_legend_patches(), fontsize=10)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0%}"))
+    ax.legend(fontsize=9, ncol=2)
 
     fig.tight_layout()
-    save_or_show(fig, output_path)
+    _save(fig, output_path)
     return fig
 
+# Plot 4 — Classification accuracy (Spearman ρ per quarter)
 
 def plot_classification_accuracy(
-    eval_df: pd.DataFrame,
+    eval_df:     pd.DataFrame,
     output_path: Optional[str] = None,
 ) -> plt.Figure:
-    """
-    Per-quarter Spearman ρ between label rank and actual forward volatility.
-
-    X-axis : quarter_start dates
-    Y-axis : Spearman ρ in [-1, 1]
-    Horizontal dashed line at 0.  Bars are green when ρ > 0, red otherwise.
-
-    Parameters
-    ----------
-    eval_df : pd.DataFrame
-        Output of classify_assets() — evaluation DataFrame.
-        Must contain columns: quarter_start, risk_profile, actual_fwd_vol.
-    output_path : str, optional
-    """
-    from scipy.stats import spearmanr as _spearmanr
     _ltr = {"conservative": 0, "balanced": 1, "aggressive": 2}
 
     quarters = sorted(eval_df["quarter_start"].dropna().unique())
-    rho_vals: List[float] = []
+    rho_vals: list[float] = []
+    splits:   list[str]   = []
 
     for q in quarters:
         q_data = eval_df[
@@ -712,93 +306,251 @@ def plot_classification_accuracy(
         ].copy()
         q_data["label_rank"] = q_data["risk_profile"].map(_ltr)
         q_data = q_data.dropna(subset=["label_rank"])
+
         if len(q_data) < 3:
             rho_vals.append(np.nan)
-            continue
-        rho, _ = _spearmanr(q_data["label_rank"].values, q_data["actual_fwd_vol"].values)
-        rho_vals.append(float(rho) if np.isfinite(rho) else np.nan)
+        else:
+            rho, _ = spearmanr(
+                q_data["label_rank"].values,
+                q_data["actual_fwd_vol"].values,
+            )
+            rho_vals.append(float(rho) if np.isfinite(rho) else np.nan)
+
+        # Determine split for this quarter
+        q_split = eval_df.loc[
+            eval_df["quarter_start"] == q, "split"
+        ].iloc[0] if "split" in eval_df.columns else "train"
+        splits.append(q_split)
 
     x      = np.arange(len(quarters))
-    colors = [
-        "#2ecc71" if (not np.isnan(v) and v > 0) else "#e74c3c"
+    colours = [
+        "#2ecc71" if (v is not None and not np.isnan(v) and v > 0)
+        else "#e74c3c"
         for v in rho_vals
     ]
-    bar_heights = [v if not np.isnan(v) else 0.0 for v in rho_vals]
+    heights = [v if (v is not None and not np.isnan(v)) else 0.0 for v in rho_vals]
 
-    fig, ax = plt.subplots(figsize=(max(10, len(quarters) * 1.2), 4))
+    fig, ax = plt.subplots(figsize=(max(12, len(quarters) * 1.1), 5))
     sns.set_style("whitegrid")
 
-    ax.bar(x, bar_heights, color=colors, alpha=0.8, edgecolor="white")
-    ax.axhline(0, color="black", linewidth=1.0, linestyle="--", alpha=0.7)
+    bars = ax.bar(x, heights, color=colours, alpha=0.82, edgecolor="white")
+
+    # Hatch test bars to distinguish them visually
+    for i, (bar, split) in enumerate(zip(bars, splits)):
+        if split == "test":
+            bar.set_hatch("//")
+            bar.set_edgecolor("#555555")
+
+    # Vertical divider between train and test
+    if "test" in splits:
+        first_test = next(i for i, s in enumerate(splits) if s == "test")
+        ax.axvline(
+            first_test - 0.5,
+            color="navy", linewidth=1.5, linestyle="--", alpha=0.7,
+        )
+        ax.text(
+            first_test - 0.4, ax.get_ylim()[1] * 0.92,
+            "← TRAIN    TEST →",
+            fontsize=9, color="navy", va="top",
+        )
+
+    ax.axhline(0, color="black", linewidth=1.0, linestyle="-", alpha=0.4)
+
     ax.set_xticks(x)
     ax.set_xticklabels(
         [str(pd.Timestamp(q).date()) for q in quarters],
         rotation=45, ha="right", fontsize=8,
     )
     ax.set_ylim(-1.1, 1.1)
-    ax.set_xlabel("Quarter Start", fontsize=12)
-    ax.set_ylabel("Spearman ρ", fontsize=12)
+    ax.set_xlabel("Quarter Start",  fontsize=12)
+    ax.set_ylabel("Spearman ρ",     fontsize=12)
     ax.set_title(
-        "Quarterly Classification Accuracy (Spearman ρ: label rank vs actual vol)",
+        "Quarterly Classification Accuracy\n"
+        "Spearman ρ: predicted label rank vs actual forward volatility  "
+        "(hatched = held-out test)",
         fontsize=13, fontweight="bold",
     )
 
+    # Annotate ρ value on each bar
+    for i, v in enumerate(rho_vals):
+        if v is not None and not np.isnan(v):
+            ax.text(
+                i, v + (0.03 if v >= 0 else -0.07),
+                f"{v:.2f}",
+                ha="center", va="bottom" if v >= 0 else "top",
+                fontsize=7, color="black",
+            )
+
+    # Legend
+    legend_elements = [
+        mpatches.Patch(facecolor="#2ecc71", label="ρ > 0  (correct ordering)"),
+        mpatches.Patch(facecolor="#e74c3c", label="ρ < 0  (inverted ordering)"),
+        mpatches.Patch(
+            facecolor="white", edgecolor="#555555",
+            hatch="//", label="Test quarter (held-out)",
+        ),
+    ]
+    ax.legend(handles=legend_elements, fontsize=9, loc="lower left")
+
     fig.tight_layout()
-    save_or_show(fig, output_path)
+    _save(fig, output_path)
     return fig
 
+# Plot 5 — Quarterly Sharpe by risk profile
+
+def plot_quarterly_sharpe(
+    eval_df:     pd.DataFrame,
+    output_path: Optional[str] = None,
+) -> plt.Figure:
+   
+    grp = (
+        eval_df.dropna(subset=["actual_sharpe", "risk_profile"])
+        .groupby(["quarter_start", "risk_profile"])["actual_sharpe"]
+        .mean()
+        .reset_index()
+    )
+
+    if grp.empty:
+        logger.warning("plot_quarterly_sharpe: no data — skipping.")
+        fig, ax = plt.subplots()
+        ax.set_title("No data")
+        _save(fig, output_path)
+        return fig
+
+    quarters = sorted(grp["quarter_start"].unique())
+    x        = np.arange(len(quarters))
+    width    = 0.25
+
+    # Determine which quarters are test
+    quarter_splits: dict = {}
+    if "split" in eval_df.columns:
+        for q in quarters:
+            sp = eval_df.loc[
+                eval_df["quarter_start"] == q, "split"
+            ].iloc[0]
+            quarter_splits[q] = sp
+
+    fig, ax = plt.subplots(figsize=(max(12, len(quarters) * 1.2), 5))
+    sns.set_style("whitegrid")
+
+    for offset, profile in enumerate(PROFILE_ORDER):
+        pgrp = grp[grp["risk_profile"] == profile]
+        vals = []
+        for q in quarters:
+            row = pgrp[pgrp["quarter_start"] == q]
+            vals.append(
+                float(row["actual_sharpe"].values[0]) if not row.empty else 0.0
+            )
+        bar_objects = ax.bar(
+            x + (offset - 1) * width,
+            vals,
+            width      = width,
+            color      = PROFILE_COLOURS[profile],
+            alpha      = 0.85,
+            label      = profile.capitalize(),
+            edgecolor  = "white",
+        )
+        # Hatch test quarter bars
+        for bar, q in zip(bar_objects, quarters):
+            if quarter_splits.get(q) == "test":
+                bar.set_hatch("//")
+                bar.set_edgecolor("#555555")
+
+    ax.axhline(0, color="grey", linewidth=0.8, linestyle="--", alpha=0.6)
+
+    # Vertical divider between train and test
+    if quarter_splits:
+        test_quarters = [q for q, s in quarter_splits.items() if s == "test"]
+        if test_quarters:
+            first_test_x = list(quarters).index(min(test_quarters))
+            ax.axvline(
+                first_test_x - 0.5,
+                color="navy", linewidth=1.5, linestyle="--", alpha=0.7,
+            )
+            ax.text(
+                first_test_x - 0.4,
+                ax.get_ylim()[1] * 0.95,
+                "← TRAIN    TEST →",
+                fontsize=9, color="navy", va="top",
+            )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(
+        [str(pd.Timestamp(q).date()) for q in quarters],
+        rotation=45, ha="right", fontsize=8,
+    )
+    ax.set_xlabel("Quarter Start",          fontsize=12)
+    ax.set_ylabel("Mean Actual Sharpe",     fontsize=12)
+    ax.set_title(
+        "Quarterly Mean Sharpe Ratio by Risk Profile\n"
+        "(hatched bars = held-out test quarters)",
+        fontsize=13, fontweight="bold",
+    )
+
+    legend_elements = _legend_patches() + [
+        mpatches.Patch(
+            facecolor="white", edgecolor="#555555",
+            hatch="//", label="Test quarter (held-out)",
+        ),
+    ]
+    ax.legend(handles=legend_elements, fontsize=9)
+
+    fig.tight_layout()
+    _save(fig, output_path)
+    return fig
+
+# plot_all — entry point called by main.py and run_rl.py
 
 def plot_all(
-    result_df: pd.DataFrame,
-    output_dir: Optional[str] = None,
-    eval_df: Optional[pd.DataFrame] = None,
+    result_df:  pd.DataFrame,
+    output_dir: Optional[str]       = None,
+    eval_df:    Optional[pd.DataFrame] = None,
 ) -> None:
-    """
-    Render all plots.  If output_dir is set, save to that directory.
+    
+    plot_cluster_assignments(
+        result_df,
+        output_path=_path(output_dir, "cluster_assignments.png"),
+    )
 
-    Plots generated
-    ---------------
-    vol_distribution.png          – volatility histogram by risk profile
-    cluster_assignments.png       – horizontal bar chart ranked by volatility
-    cluster_scatter.png           – 1-D jitter scatter of cluster separation
-    actual_risk_return.png        – actual vol vs actual return, coloured by profile
-    predicted_risk_return.png     – RL risk score vs actual return, coloured by profile
-    rl_accuracy_scatter.png       – RL score vs actual fwd vol scatter (all windows)
-    rl_accuracy_timeseries.png    – per-stock time-series of RL score vs actual vol
-    quarterly_sharpe.png          – mean Sharpe per risk profile per quarter
-    classification_accuracy.png   – per-quarter Spearman ρ bar chart
-    """
-    def _path(name: str) -> Optional[str]:
-        return f"{output_dir}/{name}" if output_dir else None
+    plot_actual_risk_return(
+        result_df,
+        output_path=_path(output_dir, "actual_risk_return.png"),
+    )
 
-    plot_volatility_distribution(result_df, output_path=_path("vol_distribution.png"))
-    plot_cluster_assignments(result_df, output_path=_path("cluster_assignments.png"))
-    plot_cluster_scatter(result_df, output_path=_path("cluster_scatter.png"))
-    plot_actual_risk_return(result_df, output_path=_path("actual_risk_return.png"))
-    plot_predicted_risk_return(result_df, output_path=_path("predicted_risk_return.png"))
-
-    # RL accuracy plots — only if the dynamic files exist
     if output_dir:
-        from pathlib import Path as _Path
-        scores_path  = _Path(output_dir) / "rl_dynamic_scores.csv"
-        fwd_vol_path = _Path(output_dir) / "rl_dynamic_fwd_vol.csv"
+        scores_path  = Path(output_dir) / "rl_dynamic_scores.csv"
+        fwd_vol_path = Path(output_dir) / "rl_dynamic_fwd_vol.csv"
+
         if scores_path.exists() and fwd_vol_path.exists():
-            scores_df  = pd.read_csv(scores_path,  index_col=0, parse_dates=True)
-            fwd_vol_df = pd.read_csv(fwd_vol_path, index_col=0, parse_dates=True)
-            plot_rl_vs_actual_vol_scatter(
-                scores_df, fwd_vol_df, result_df,
-                output_path=_path("rl_accuracy_scatter.png"),
+            scores_df  = pd.read_csv(
+                scores_path,  index_col=0, parse_dates=True
             )
-            plot_rl_vs_actual_vol_timeseries(
+            fwd_vol_df = pd.read_csv(
+                fwd_vol_path, index_col=0, parse_dates=True
+            )
+            
+            plot_rl_accuracy_scatter(
                 scores_df, fwd_vol_df, result_df,
-                output_path=_path("rl_accuracy_timeseries.png"),
+                output_path=_path(output_dir, "rl_accuracy_scatter.png"),
+            )
+        else:
+            logger.warning(
+                "rl_dynamic_scores.csv or rl_dynamic_fwd_vol.csv not found "
+                "— skipping rl_accuracy_scatter.png"
             )
 
-    # Quarterly evaluation plots — only if eval_df is provided and non-empty
     if eval_df is not None and not eval_df.empty:
-        plot_quarterly_sharpe(
-            eval_df, output_path=_path("quarterly_sharpe.png")
-        )
         plot_classification_accuracy(
-            eval_df, output_path=_path("classification_accuracy.png")
+            eval_df,
+            output_path=_path(output_dir, "classification_accuracy.png"),
+        )
+
+        plot_quarterly_sharpe(
+            eval_df,
+            output_path=_path(output_dir, "quarterly_sharpe.png"),
+        )
+    else:
+        logger.warning(
+            "eval_df not provided — skipping classification_accuracy.png "
+            "and quarterly_sharpe.png"
         )
