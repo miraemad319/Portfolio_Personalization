@@ -238,31 +238,31 @@ class RLAssetSelectorAgent:
     ) -> None:
        
         logger.info(
-            "Pretraining actor on forward vol targets "
-            "(train windows only: idx in [%d, %d)) …",
+            "Pretraining actor on composite rank targets "
+            "(0.7 × rank(fwd_vol) + 0.3 × rank(fwd_max_dd), "
+            "train windows only: idx in [%d, %d)) …",
             env._start_idx, env._end_idx,
         )
 
         X_list: List[np.ndarray] = []
         y_list: List[np.ndarray] = []
 
-        # iter_all_windows with no args uses [_start_idx, _end_idx) by default.
-        # FIX 1: compute percentile rank of fwd_vol WITHIN each window before
-        # appending, so the pretraining target is a [0,1] rank — consistent with
-        # the Spearman rank-correlation reward used in PPO.  The old approach
-        # normalised vol globally across all windows, which created a
-        # time-regime signal (high vol era vs low vol era) unrelated to the
-        # cross-sectional ranking the agent actually needs to learn.
         for _date, obs, idx, valid_mask in env.iter_all_windows():
             fwd_vol = env._compute_forward_vol(idx)
-            valid   = valid_mask & np.isfinite(fwd_vol)
+            fwd_dd  = env._compute_forward_max_dd(idx)
+
+            # Intersection mask: both forward labels must be finite
+            valid = valid_mask & np.isfinite(fwd_vol) & np.isfinite(fwd_dd)
             if valid.sum() < 3:
                 continue
-            # Rank within this window: 0.0 = lowest vol, 1.0 = highest vol
-            vol_valid = fwd_vol[valid]
-            ranks = pd.Series(vol_valid).rank(pct=True).values.astype(np.float32)
+
+            # Composite rank — same formula as _compute_reward
+            vol_rank = pd.Series(fwd_vol[valid]).rank(pct=True).values.astype(np.float32)
+            dd_rank  = pd.Series(fwd_dd[valid]).rank(pct=True).values.astype(np.float32)
+            composite_rank = (0.7 * vol_rank + 0.3 * dd_rank).astype(np.float32)
+
             X_list.append(obs[valid])
-            y_list.append(ranks)
+            y_list.append(composite_rank)
 
         if not X_list:
             logger.warning("Pretraining: no valid pairs found — skipping.")
@@ -304,14 +304,9 @@ class RLAssetSelectorAgent:
         """
         Run a single PPO episode and return its stats dict.
 
-        Used by the early-stopping loop in asset_selector.classify_assets()
-        so the caller controls the episode loop and can break at any time.
-        The internal train() method still exists for callers that want the
-        simple fixed-episode interface.
         """
         rollout                      = self._collect_rollout(env)
         loss, actor_loss, value_loss = self._ppo_update(rollout)
-        rewards = rollout["rewards"]
 
         rewards = rollout["rewards"]
         return {
@@ -322,46 +317,6 @@ class RLAssetSelectorAgent:
             "value_loss":   value_loss,
         }
 
-    def train(
-        self,
-        env,
-        n_episodes: int = 150,
-        log_every:  int = 10,
-    ) -> List[Dict]:
-        # FIX 3: cosine LR scheduler removed.  The original CosineAnnealingLR
-        # with a single eta_min applied the same floor to both param groups,
-        # collapsing the 3× actor/critic LR ratio established in __init__.
-        # For 150–300 episodes on a small dataset, a fixed LR is simpler and
-        # avoids that instability.  If you want to add LR decay later, use
-        # separate schedulers per param group with matching eta_min ratios.
-        history: List[Dict] = []
-
-        for ep in range(1, n_episodes + 1):
-            rollout                      = self._collect_rollout(env)
-            loss, actor_loss, value_loss = self._ppo_update(rollout)
-
-            rewards = rollout["rewards"]
-            stats = {
-                "episode":      ep,
-                "mean_reward":  float(np.mean(rewards)),
-                "total_reward": float(np.sum(rewards)),
-                "loss":         loss,
-                "actor_loss":   actor_loss,
-                "value_loss":   value_loss,
-            }
-            history.append(stats)
-
-            if ep % log_every == 0 or ep == 1:
-                logger.info(
-                    "Episode %3d/%d  mean_reward=%.4f  "
-                    "actor_loss=%.4f  value_loss=%.4f",
-                    ep, n_episodes,
-                    stats["mean_reward"],
-                    stats["actor_loss"],
-                    stats["value_loss"],
-                )
-
-        return history
 
     def _collect_rollout(self, env) -> Dict:
         self.actor.train()
@@ -616,10 +571,10 @@ class RLAssetSelectorAgent:
             if not scores_in_q:
                 continue
 
-            score_arr   = np.stack(scores_in_q, axis=0)
-            with np.errstate(all="ignore"):  # suppress Mean of empty slice warning
+            score_arr = np.stack(scores_in_q, axis=0)
+            with np.errstate(all="ignore"):  # suppress Mean of empty slice
                 mean_scores = np.nanmean(score_arr, axis=0)
-            mean_scores[np.isfinite(score_arr).sum(axis=0) < 1] = np.nan
+                mean_scores[np.isfinite(score_arr).sum(axis=0) < 3] = np.nan
 
             cluster_ids, risk_profiles = env.assign_clusters(
                 mean_scores, thresholds=thresholds

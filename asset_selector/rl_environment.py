@@ -282,8 +282,10 @@ class AssetSelectorEnv(gym.Env):
         # First valid step: need a full lookback window
         self._start_idx = lookback
 
-        # Last valid step overall: need a full forward window after it
-        self._full_end_idx = len(prices) - forward - 1
+        # Last valid step overall: a step at idx reads [idx, idx+forward).
+        # The slice is valid as long as idx + forward <= len(prices),
+        # i.e. idx <= len(prices) - forward.
+        self._full_end_idx = len(prices) - forward
 
         if train_end_idx is not None:
             # _end_idx is the PPO episode boundary.
@@ -486,61 +488,38 @@ class AssetSelectorEnv(gym.Env):
 
     def _compute_reward(self, idx: int, risk_scores: np.ndarray) -> float:
         """
-        Composite Spearman reward:
+        Composite Spearman reward.
 
-        FIX 6: The drawdown component is now gated on sign agreement with the
-        vol component.  Previously both components were always summed, so an
-        agent that ranked vol correctly but inverted on drawdown still received
-        partial positive reward.  The new logic:
+        Target rank = 0.7 × rank(fwd_vol) + 0.3 × rank(fwd_max_dd),
+        computed over the intersection of tickers where BOTH fwd_vol AND
+        fwd_max_dd are finite.  Using the intersection (rather than separate
+        masks per component) means the reward is always measured on the same
+        population, so the composite rank is coherent and the gradient signal
+        is consistent across episodes.
 
-          - Both agree (corr_vol > 0 and corr_dd > 0):
-              reward = 0.6 × corr_vol + 0.4 × corr_dd   (full reward)
-          - Vol correct, dd inverted:
-              reward = 0.6 × corr_vol                    (partial; no dd bonus)
-          - Vol wrong (corr_vol ≤ 0):
-              reward = 0.6 × corr_vol + 0.4 × corr_dd   (full penalty applies)
-
-        This asymmetry means the agent only collects the drawdown bonus when
-        both signals are consistent, while wrong vol predictions are still
-        penalised by both components.  The result is a sharper gradient when
-        the agent is on the right track.
-
-        Returns 0.0 if fewer than 3 valid tickers for every component.
+        Returns 0.0 if fewer than 3 tickers satisfy the intersection mask.
         """
         fwd_vol  = self._compute_forward_vol(idx)
         fwd_dd   = self._compute_forward_max_dd(idx)
         has_data = self._get_valid_mask(idx)
 
-        corr_vol = np.nan
-        corr_dd  = np.nan
+        # Intersection: ticker must have valid features AND both forward labels
+        valid = (
+            has_data
+            & np.isfinite(risk_scores)
+            & np.isfinite(fwd_vol)
+            & np.isfinite(fwd_dd)
+        )
+        if valid.sum() < 3:
+            return 0.0
 
-        valid_vol = has_data & np.isfinite(risk_scores) & np.isfinite(fwd_vol)
-        if valid_vol.sum() >= 3:
-            cv, _ = spearmanr(risk_scores[valid_vol], fwd_vol[valid_vol])
-            if np.isfinite(cv):
-                corr_vol = float(cv)
+        # Percentile ranks within this window (ties broken by average)
+        vol_rank = pd.Series(fwd_vol[valid]).rank(pct=True).values.astype(np.float64)
+        dd_rank  = pd.Series(fwd_dd[valid]).rank(pct=True).values.astype(np.float64)
+        composite_rank = 0.7 * vol_rank + 0.3 * dd_rank
 
-        valid_dd = has_data & np.isfinite(risk_scores) & np.isfinite(fwd_dd)
-        if valid_dd.sum() >= 3:
-            cd, _ = spearmanr(risk_scores[valid_dd], fwd_dd[valid_dd])
-            if np.isfinite(cd):
-                corr_dd = float(cd)
-
-        # Vol component always contributes (positive or negative signal)
-        reward = 0.0
-        if np.isfinite(corr_vol):
-            reward += 0.6 * corr_vol
-
-        if np.isfinite(corr_dd):
-            if np.isfinite(corr_vol) and corr_vol > 0 and corr_dd > 0:
-                # Both signals agree and are positive: full drawdown bonus
-                reward += 0.4 * corr_dd
-            elif not np.isfinite(corr_vol) or corr_vol <= 0:
-                # Vol is wrong: drawdown penalty applies in full
-                reward += 0.4 * corr_dd
-            # else: vol right, dd inverted → skip dd component (no bonus)
-
-        return reward
+        rho, _ = spearmanr(risk_scores[valid], composite_rank)
+        return float(rho) if np.isfinite(rho) else 0.0
 
     # Inference iteration 
 

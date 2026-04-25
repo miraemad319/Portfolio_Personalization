@@ -236,34 +236,51 @@ def classify_assets(
         fwd_ret_matrix = train_fwd_ret_matrix
         mean_scores    = train_mean_scores
 
-    # Compute classification thresholds from training scores:
-    # Use the 33rd and 67th percentile of all valid training window scores
-    # as fixed cut points. Derived purely from training data and applied
-    # consistently to both train and test quarters
-    train_scores_flat = train_score_matrix[np.isfinite(train_score_matrix)]
-    if len(train_scores_flat) < 10:
-        raise ValueError(
-            "Too few valid training scores to compute thresholds. "
-            "Check that the training period contains sufficient data."
-        )
-    t_low  = float(np.percentile(train_scores_flat, 33.3))
-    t_high = float(np.percentile(train_scores_flat, 66.7))
-    thresholds = (t_low, t_high)
-    logger.info(
-        "Classification thresholds (from training score distribution): "
-        "t_low=%.4f  t_high=%.4f",
-        t_low, t_high,
+    
+    
+    # Inference — quarterly classifications
+    # score training windows without thresholds to derive cut points
+    logger.info("Quarterly scoring on TRAIN windows (threshold derivation) …")
+    train_quarterly = agent.collect_quarterly_scores(
+        env,
+        start_idx  = env._start_idx,
+        end_idx    = env._end_idx,
+        thresholds = None,
     )
 
-    # Inference — quarterly classifications 
+    # derive thresholds from the exact scores that will be classified
+    train_q_score_matrix = np.stack(
+        [q["mean_scores"] for q in train_quarterly], axis=0
+    )
+    with np.errstate(all="ignore"):
+        train_q_mean_per_ticker = np.nanmean(train_q_score_matrix, axis=0)
+
+    valid_train_q_means = train_q_mean_per_ticker[
+        np.isfinite(train_q_mean_per_ticker)
+    ]
+    if len(valid_train_q_means) < 3:
+        raise ValueError(
+            "Too few valid training quarterly scores to compute thresholds."
+        )
+    t_low  = float(np.percentile(valid_train_q_means, 33.3))
+    t_high = float(np.percentile(valid_train_q_means, 66.7))
+    thresholds = (t_low, t_high)
+    logger.info(
+        "Classification thresholds (tertile of per-ticker mean quarterly "
+        "training scores, %d tickers): t_low=%.4f  t_high=%.4f",
+        len(valid_train_q_means), t_low, t_high,
+    )
+
+    # re-run train quarterly inference with the correct thresholds
     logger.info("Quarterly inference on TRAIN windows …")
     train_quarterly = agent.collect_quarterly_scores(
         env,
-        start_idx = env._start_idx,
-        end_idx   = env._end_idx,
+        start_idx  = env._start_idx,
+        end_idx    = env._end_idx,
         thresholds = thresholds,
-        
     )
+    for q in train_quarterly:
+        q["split"] = "train"
     for q in train_quarterly:
         q["split"] = "train"
 
@@ -475,15 +492,33 @@ def _log_summary(
             )
 
     logger.info("Mean actual Sharpe and forward vol per risk profile:")
+    profile_mean_vol: dict = {}
     for profile in ("conservative", "balanced", "aggressive"):
         grp = eval_df[eval_df["risk_profile"] == profile]
         if not grp.empty:
+            mean_vol = float(grp["actual_fwd_vol"].mean())
+            profile_mean_vol[profile] = mean_vol
             logger.info(
                 "  %-12s  mean_sharpe=%+.3f  mean_fwd_vol=%.3f",
                 profile,
                 float(grp["actual_sharpe"].mean()),
-                float(grp["actual_fwd_vol"].mean()),
+                mean_vol,
             )
+
+    # Top-bottom vol spread — primary evidence of tier separation quality.
+    # A positive spread confirms aggressive tickers are genuinely higher-risk
+    # than conservative ones on the forward window.  Values < 0.05 suggest
+    # the tiers are not meaningfully separated.
+    if "aggressive" in profile_mean_vol and "conservative" in profile_mean_vol:
+        spread = profile_mean_vol["aggressive"] - profile_mean_vol["conservative"]
+        logger.info(
+            "top-bottom vol spread (aggressive − conservative): %.4f", spread
+        )
+    else:
+        logger.info(
+            "top-bottom vol spread: N/A "
+            "(one or both boundary tiers have no valid rows in eval_df)"
+        )
 
     valid_correct = eval_df["classification_correct"].dropna()
     if not valid_correct.empty:

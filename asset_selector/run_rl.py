@@ -21,6 +21,7 @@ import torch
 random.seed(1)
 np.random.seed(1)
 torch.manual_seed(1)
+torch.use_deterministic_algorithms(True)
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))

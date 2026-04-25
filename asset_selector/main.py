@@ -265,6 +265,13 @@ def run_pipeline(
 
 # CLI
 def _cli() -> None:
+    import random
+    import numpy as np
+    import torch
+    random.seed(1)
+    np.random.seed(1)
+    torch.manual_seed(1)
+    torch.use_deterministic_algorithms(True)
     logging.basicConfig(
         level   = logging.INFO,
         format  = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
