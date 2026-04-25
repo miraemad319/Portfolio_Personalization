@@ -93,14 +93,20 @@ def _load_prices(
     start:      date,
     end:        date,
     prices_dir: Path,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Read per-ticker CSVs, apply preprocessing rules, filter to [start, end].
 
-    Returns a close-price DataFrame (DatetimeIndex, columns = tickers).
-    Tickers without a CSV on disk are skipped with a warning.
+    Returns
+    -------
+    close_df  : pd.DataFrame  DatetimeIndex, columns = tickers, close prices
+    volume_df : pd.DataFrame  DatetimeIndex, columns = tickers, raw volume
+                Volume is NOT preprocessed with the three rules — NaN where
+                missing, 0.0 where the stock was inactive. Forward-fill is
+                not applied to volume because zero volume is meaningful.
     """
-    frames: dict[str, pd.Series] = {}
+    close_frames:  dict[str, pd.Series] = {}
+    volume_frames: dict[str, pd.Series] = {}
 
     for ticker in universe:
         csv_path = prices_dir / f"{ticker}.csv"
@@ -114,49 +120,66 @@ def _load_prices(
 
         raw = pd.read_csv(csv_path, index_col=0, parse_dates=True)
 
-        # egxpy returns Open/High/Low/Close/Volume 
         close_col = next(
             (c for c in raw.columns if c.lower() == "close"), None
         )
         if close_col is None:
             close_col = raw.columns[-1]
 
-        s       = raw[close_col].sort_index()
-        s.index = pd.to_datetime(s.index).normalize()
+        vol_col = next(
+            (c for c in raw.columns if c.lower() == "volume"), None
+        )
 
-        if not s.empty:
-            frames[ticker] = s
+        s_close = raw[close_col].sort_index()
+        s_close.index = pd.to_datetime(s_close.index).normalize()
+        if not s_close.empty:
+            close_frames[ticker] = s_close
 
-    if not frames:
+        if vol_col is not None:
+            s_vol = raw[vol_col].sort_index()
+            s_vol.index = pd.to_datetime(s_vol.index).normalize()
+            if not s_vol.empty:
+                volume_frames[ticker] = s_vol
+
+    if not close_frames:
         raise FileNotFoundError(
             f"No price CSVs found in {prices_dir}. "
             "Run asset_selector/download_egx_prices.py first."
         )
 
-    # Outer join preserves per-ticker NaN structure for preprocessing
-    combined = pd.DataFrame(frames).sort_index()
-    combined = combined.loc[~combined.index.duplicated(keep="first")]
+    # Close prices — outer join, apply preprocessing rules
+    close_df = pd.DataFrame(close_frames).sort_index()
+    close_df = close_df.loc[~close_df.index.duplicated(keep="first")]
+    close_df = _apply_preprocessing(close_df)
+    close_df = close_df.loc[str(start) : str(end)]
 
-    combined = _apply_preprocessing(combined)
-
-    # Filter to requested date range
-    combined = combined.loc[str(start) : str(end)]
+    # Volume — outer join, no preprocessing rules applied
+    # Replace NaN with 0 so downstream code can safely check vol > 0
+    if volume_frames:
+        volume_df = pd.DataFrame(volume_frames).sort_index()
+        volume_df = volume_df.loc[~volume_df.index.duplicated(keep="first")]
+        volume_df = volume_df.loc[str(start) : str(end)]
+        # Align to close index
+        volume_df = volume_df.reindex(close_df.index).fillna(0.0)
+    else:
+        logger.warning("No volume data found — volume features will be NaN.")
+        volume_df = pd.DataFrame(
+            0.0, index=close_df.index, columns=close_df.columns
+        )
 
     logger.info(
         "Prices loaded: %d tickers  %d rows  (%s → %s)",
-        combined.shape[1],
-        combined.shape[0],
-        combined.index[0].date(),
-        combined.index[-1].date(),
+        close_df.shape[1], close_df.shape[0],
+        close_df.index[0].date(), close_df.index[-1].date(),
     )
-    return combined
+    return close_df, volume_df
 
 # Pipeline
 
 def run_pipeline(
     output_dir:     str            = "asset_selector/output",
     generate_plots: bool           = True,
-    n_episodes:     int            = 150,
+    n_episodes:     int            = 250,
     start:          date           = date(2020, 1, 1),
     end:            date           = date(2026, 4, 22),
     train_end:      Optional[str]  = "2024-12-31",
@@ -190,12 +213,17 @@ def run_pipeline(
     logger.info("=" * 60)
     logger.info("Stage 2 / 4 — Loading prices from %s", pdir)
     logger.info("=" * 60)
-    prices = _load_prices(universe, start=start, end=end, prices_dir=pdir)
+    prices, volume = _load_prices(universe, start=start, end=end, prices_dir=pdir)
 
-    # Cache prices so run_rl.py can skip this stage on reruns
+    # Cache both so run_rl.py can skip this stage
     prices_path = out / "prices.parquet"
+    volume_path = out / "volume.parquet"
     prices.to_parquet(prices_path)
-    logger.info("Prices cached to %s", prices_path)
+    volume.to_parquet(volume_path)
+    logger.info("Prices cached to %s  Volume cached to %s", 
+                prices_path, volume_path,
+    )
+
 
     # Stage 3: RL risk profiling 
     logger.info("=" * 60)
@@ -203,6 +231,7 @@ def run_pipeline(
     logger.info("=" * 60)
     quarterly_df, eval_df, static_df = classify_assets(
         prices,
+        volume     = volume,
         n_episodes = n_episodes,
         train_end  = train_end,
         output_dir = output_dir,
@@ -266,13 +295,13 @@ def _cli() -> None:
     parser.add_argument(
         "--n-episodes",
         type    = int,
-        default = 150,
+        default = 250,
         metavar = "N",
-        help    = "PPO training episodes (default: 150)",
+        help    = "PPO training episodes (default: 250)",
     )
     parser.add_argument(
         "--train-end",
-        default = "2023-12-31",
+        default = "2024-12-31",
         metavar = "DATE",
         help    = (
             "Last day of the training period in ISO format "

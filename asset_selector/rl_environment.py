@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 TRADING_DAYS = 252
 FEATURE_NAMES = [
+    # --- original 13 features ---
     "realised_vol",
     "mean_return",
     "sharpe",
@@ -23,6 +24,14 @@ FEATURE_NAMES = [
     "vol_trend",
     "downside_vol",
     "beta",
+    "volume_trend",
+    "volume_shock",
+    # --- 5 new features ---
+    "vol_of_vol",         # std of rolling 21d vol — measures vol stability
+    "vol_autocorr",       # lag-1 autocorr of squared returns — GARCH persistence signal
+    "market_stress",      # ticker vol / cross-sectional median vol — regime position
+    "pain_index",         # mean drawdown depth over window — smoother than max_dd
+    "return_consistency", # fraction of positive-return days — orthogonal behavioural signal
 ]
 
 # Feature helpers
@@ -31,19 +40,23 @@ FEATURE_NAMES = [
 def _window_features(
     ret_window: pd.DataFrame,
     px_window: pd.DataFrame,
+    vol_window: pd.DataFrame,
 ) -> np.ndarray:
     """
-    Compute a (n_tickers, 11) feature matrix for one time window.
+    Compute a (n_tickers, 18) feature matrix for one time window.
 
     Parameters
     ret_window : pd.DataFrame
         Daily log returns for the lookback window.
     px_window : pd.DataFrame
         Close prices for the same window.
+    vol_window : pd.DataFrame  Daily volume for the same window.
 
     Returns
-    np.ndarray shape (n_tickers, 11), dtype float32.
+    np.ndarray shape (n_tickers, 18), dtype float32.
     NaN for tickers with fewer than 5 valid returns.
+    Original 13 features + 5 new: vol_of_vol, vol_autocorr,
+    market_stress, pain_index, return_consistency.
     """
     n_features = len(FEATURE_NAMES)
     tickers = ret_window.columns.tolist()
@@ -52,6 +65,7 @@ def _window_features(
     for ticker in tickers:
         ret = ret_window[ticker].dropna()
         px  = px_window[ticker].dropna()
+        volume_series = vol_window[ticker].replace(0.0, np.nan).dropna()
         n   = len(ret)
 
         if n < 5:
@@ -114,12 +128,92 @@ def _window_features(
         else:
             beta = np.nan
 
+        #vol trends
+        if len(volume_series) >= 21:
+            recent_mean_vol = float(volume_series.iloc[-21:].mean())
+            full_mean_vol   = float(volume_series.mean())
+            volume_trend    = (
+                float(recent_mean_vol / full_mean_vol)
+                if full_mean_vol > 1e-8 else np.nan
+            )
+        else:
+            volume_trend = np.nan
+
+        #vol shock
+        if len(volume_series) >= 10:
+            median_vol   = float(volume_series.median())
+            max_vol      = float(volume_series.max())
+            volume_shock = (
+                float(max_vol / median_vol)
+                if median_vol > 1e-8 else np.nan
+            )
+        else:
+            volume_shock = np.nan
+
         rows.append([
             vol, mean_ret, sharpe, max_dd, skew, kurt,
-            mom_21, mom_63, vol_trend, downside_vol, beta,
+            mom_21, mom_63, vol_trend, downside_vol, beta, volume_trend, volume_shock,
+            np.nan, np.nan, np.nan, np.nan, np.nan,  # placeholders for new features
         ])
 
-    return np.array(rows, dtype=np.float32)
+    feat_matrix = np.array(rows, dtype=np.float32)  # shape (n_tickers, 18)
+
+    # ── Compute the 5 new features ────────────────────────────────────────────
+    # Index offsets for the placeholder columns:
+    IDX_VOL_OF_VOL    = 13
+    IDX_VOL_AUTOCORR  = 14
+    IDX_MARKET_STRESS = 15
+    IDX_PAIN_INDEX    = 16
+    IDX_CONSISTENCY   = 17
+
+    # Cross-sectional median realised_vol (column 0) for market_stress
+    all_vols = feat_matrix[:, 0]  # realised_vol per ticker
+    valid_vols = all_vols[np.isfinite(all_vols)]
+    cross_median_vol = float(np.median(valid_vols)) if len(valid_vols) >= 3 else np.nan
+
+    for i, ticker in enumerate(tickers):
+        ret = ret_window[ticker].dropna()
+        n   = len(ret)
+
+        if n < 5:
+            # All new features stay NaN — already set above
+            continue
+
+        # vol_of_vol: std of rolling 21-day annualised vol
+        # Requires at least 42 observations to get 2+ non-NaN rolling windows
+        if n >= 42:
+            roll_vol = (
+                ret.rolling(21).std().dropna() * np.sqrt(TRADING_DAYS)
+            )
+            feat_matrix[i, IDX_VOL_OF_VOL] = float(roll_vol.std()) if len(roll_vol) >= 2 else np.nan
+        # else: stays NaN
+
+        # vol_autocorr: lag-1 autocorrelation of squared returns
+        # Squared returns are the standard proxy for variance in GARCH literature
+        if n >= 10:
+            sq_ret = ret.values ** 2
+            if sq_ret.std() > 1e-10:
+                autocorr = float(np.corrcoef(sq_ret[:-1], sq_ret[1:])[0, 1])
+                feat_matrix[i, IDX_VOL_AUTOCORR] = autocorr if np.isfinite(autocorr) else np.nan
+
+        # market_stress: this ticker's vol relative to cross-sectional median
+        # > 1.0 means this stock is more volatile than the median today
+        ticker_vol = feat_matrix[i, 0]  # realised_vol already computed
+        if np.isfinite(ticker_vol) and np.isfinite(cross_median_vol) and cross_median_vol > 1e-8:
+            feat_matrix[i, IDX_MARKET_STRESS] = ticker_vol / cross_median_vol
+
+        # pain_index: mean of the drawdown series (not just the worst point)
+        # Gives a smoother picture of how much time the stock spent underwater
+        if n > 2:
+            cum      = np.exp(ret.cumsum())
+            roll_max = cum.cummax()
+            dd_series = (cum - roll_max) / roll_max  # always <= 0
+            feat_matrix[i, IDX_PAIN_INDEX] = float(abs(dd_series.mean()))
+
+        # return_consistency: fraction of trading days with positive returns
+        feat_matrix[i, IDX_CONSISTENCY] = float((ret > 0).sum() / n)
+
+    return feat_matrix
 
 
 def _zscore_normalise(X: np.ndarray) -> np.ndarray:
@@ -150,6 +244,7 @@ class AssetSelectorEnv(gym.Env):
     def __init__(
         self,
         prices:        pd.DataFrame,
+        volume:        Optional[pd.DataFrame] = None,
         lookback:      int           = 126,
         forward:       int           = 63,
         step_size:     int           = 21,
@@ -166,6 +261,17 @@ class AssetSelectorEnv(gym.Env):
         self.step_size   = step_size
         self.n_clusters  = n_clusters
         self.feature_dim = len(FEATURE_NAMES)
+
+        # Volume: replace 0.0 and NaN with NaN for clean ratio computation
+        if volume is not None:
+            self.volume: pd.DataFrame = (
+                volume.replace(0.0, np.nan)
+                .reindex(index=self.prices.index, columns=self.tickers)
+            )
+        else:
+            self.volume = pd.DataFrame(
+                np.nan, index=self.prices.index, columns=self.tickers
+            )
 
         # Pre-compute log returns once — 0.0 already replaced above
         self.log_returns: pd.DataFrame = np.log(
@@ -303,7 +409,8 @@ class AssetSelectorEnv(gym.Env):
         """
         ret_win = self.log_returns.iloc[idx - self.lookback : idx]
         px_win  = self.prices.iloc[idx - self.lookback : idx]
-        raw     = _window_features(ret_win, px_win)
+        vol_win = self.volume.iloc[idx - self.lookback : idx]
+        raw     = _window_features(ret_win, px_win, vol_win)
         return _zscore_normalise(raw).astype(np.float32)
 
     # Forward metrics (reward and evaluation) 
@@ -380,30 +487,58 @@ class AssetSelectorEnv(gym.Env):
     def _compute_reward(self, idx: int, risk_scores: np.ndarray) -> float:
         """
         Composite Spearman reward:
-            0.6 × Spearman(scores, fwd_vol) + 0.4 × Spearman(scores, fwd_max_dd)
 
-        Tickers with NaN in either forward metric or with insufficient lookback
-        data are excluded per component.
+        FIX 6: The drawdown component is now gated on sign agreement with the
+        vol component.  Previously both components were always summed, so an
+        agent that ranked vol correctly but inverted on drawdown still received
+        partial positive reward.  The new logic:
+
+          - Both agree (corr_vol > 0 and corr_dd > 0):
+              reward = 0.6 × corr_vol + 0.4 × corr_dd   (full reward)
+          - Vol correct, dd inverted:
+              reward = 0.6 × corr_vol                    (partial; no dd bonus)
+          - Vol wrong (corr_vol ≤ 0):
+              reward = 0.6 × corr_vol + 0.4 × corr_dd   (full penalty applies)
+
+        This asymmetry means the agent only collects the drawdown bonus when
+        both signals are consistent, while wrong vol predictions are still
+        penalised by both components.  The result is a sharper gradient when
+        the agent is on the right track.
+
         Returns 0.0 if fewer than 3 valid tickers for every component.
-
         """
         fwd_vol  = self._compute_forward_vol(idx)
         fwd_dd   = self._compute_forward_max_dd(idx)
         has_data = self._get_valid_mask(idx)
 
-        reward = 0.0
+        corr_vol = np.nan
+        corr_dd  = np.nan
 
         valid_vol = has_data & np.isfinite(risk_scores) & np.isfinite(fwd_vol)
         if valid_vol.sum() >= 3:
-            corr_vol, _ = spearmanr(risk_scores[valid_vol], fwd_vol[valid_vol])
-            if np.isfinite(corr_vol):
-                reward += 0.6 * corr_vol
+            cv, _ = spearmanr(risk_scores[valid_vol], fwd_vol[valid_vol])
+            if np.isfinite(cv):
+                corr_vol = float(cv)
 
         valid_dd = has_data & np.isfinite(risk_scores) & np.isfinite(fwd_dd)
         if valid_dd.sum() >= 3:
-            corr_dd, _ = spearmanr(risk_scores[valid_dd], fwd_dd[valid_dd])
-            if np.isfinite(corr_dd):
+            cd, _ = spearmanr(risk_scores[valid_dd], fwd_dd[valid_dd])
+            if np.isfinite(cd):
+                corr_dd = float(cd)
+
+        # Vol component always contributes (positive or negative signal)
+        reward = 0.0
+        if np.isfinite(corr_vol):
+            reward += 0.6 * corr_vol
+
+        if np.isfinite(corr_dd):
+            if np.isfinite(corr_vol) and corr_vol > 0 and corr_dd > 0:
+                # Both signals agree and are positive: full drawdown bonus
                 reward += 0.4 * corr_dd
+            elif not np.isfinite(corr_vol) or corr_vol <= 0:
+                # Vol is wrong: drawdown penalty applies in full
+                reward += 0.4 * corr_dd
+            # else: vol right, dd inverted → skip dd component (no bonus)
 
         return reward
 

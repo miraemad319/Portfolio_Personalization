@@ -48,12 +48,15 @@ logger = logging.getLogger(__name__)
 
 def classify_assets(
     prices:     pd.DataFrame,
+    volume:     Optional[pd.DataFrame] = None,
     n_clusters: int            = 3,
-    n_episodes: int            = 150,
+    n_episodes: int            = 300,    # FIX 7: was 150. With gamma=0 and minibatch
+                               # shuffling, each episode is cheaper to credit-assign
+                               # correctly, so more episodes are affordable and useful.
     lookback:   int            = 126,
     forward:    int            = 63,
     step_size:  int            = 21,
-    train_end:  Optional[str]  = "2023-12-31",
+    train_end:  Optional[str]  = "2024-12-31",
     output_dir: Optional[str]  = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if n_clusters != 3:
@@ -83,6 +86,15 @@ def classify_assets(
 
     # Sort alphabetically so ticker order is deterministic across runs
     prices_aligned = prices[sorted(data_tickers)]
+    # Align volume to the same ticker set and index
+    if volume is not None:
+        volume_aligned = volume.reindex(
+            columns=sorted(data_tickers), index=prices_aligned.index
+        ).fillna(0.0)
+    else:
+        volume_aligned = pd.DataFrame(
+            0.0, index=prices_aligned.index, columns=sorted(data_tickers)
+        )
 
     logger.info(
         "classify_assets: %d tickers  %d rows  "
@@ -115,6 +127,7 @@ def classify_assets(
     # Build environment 
     env = AssetSelectorEnv(
         prices        = prices_aligned,
+        volume        = volume_aligned,
         lookback      = lookback,
         forward       = forward,
         step_size     = step_size,
@@ -127,20 +140,66 @@ def classify_assets(
         feature_dim   = env.feature_dim,
         hidden_dims   = [128, 64, 32],
         lr            = 3e-4,
-        gamma         = 0.99,
-        entropy_coeff = 0.05,
+        gamma         = 0.0,    # FIX 2: independent ranking steps — no discounting
+        gae_lambda    = 0.0,    # FIX 2: consistent with gamma=0
+        entropy_coeff = 0.0,    # FIX 4: replaced by diversity_loss in _ppo_update
         device        = "cpu",
     )
 
     # Supervised pretraining 
     agent.pretrain(env, n_epochs=150, lr_pretrain=1e-3)
 
-    # PPO fine-tuning 
-    logger.info("PPO fine-tuning for %d episodes …", n_episodes)
-    history    = agent.train(env, n_episodes=n_episodes, log_every=10)
-    mean_rew   = float(np.mean([h["mean_reward"] for h in history[-10:]]))
-    logger.info("Training complete. Mean reward (last 10 episodes): %.4f", mean_rew)
+    es_window      = 20    # smooth over last N episodes
+    es_check_every = 10    # evaluate plateau every N episodes
+    es_patience    = 4     # stop after this many consecutive flat checks
+    es_min_delta   = 5e-4  # minimum improvement to count as progress
 
+    logger.info("PPO fine-tuning (max %d episodes, early stopping active) …", n_episodes)
+
+    history:          list  = []
+    es_counter:       int   = 0
+    es_best_smoothed: float = -np.inf
+
+    for ep in range(1, n_episodes + 1):
+        ep_stats = agent.train_one_episode(env)
+        history.append(ep_stats)
+
+        if ep % 10 == 0 or ep == 1:
+            logger.info(
+                "Episode %3d/%d  mean_reward=%.4f  "
+                "actor_loss=%.4f  value_loss=%.4f",
+                ep, n_episodes,
+                ep_stats["mean_reward"],
+                ep_stats["actor_loss"],
+                ep_stats["value_loss"],
+            )
+
+        if ep >= es_window and ep % es_check_every == 0:
+            recent_rewards = [h["mean_reward"] for h in history[-es_window:]]
+            smoothed       = float(np.mean(recent_rewards))
+            improvement    = smoothed - es_best_smoothed
+
+            if improvement > es_min_delta:
+                es_best_smoothed = smoothed
+                es_counter       = 0
+            else:
+                es_counter += 1
+                logger.info(
+                    "  Early stopping: no improvement (smoothed=%.4f, best=%.4f, "
+                    "patience %d/%d)",
+                    smoothed, es_best_smoothed, es_counter, es_patience,
+                )
+                if es_counter >= es_patience:
+                    logger.info(
+                        "Early stopping triggered at episode %d "
+                        "(smoothed reward plateau: %.4f)",
+                        ep, es_best_smoothed,
+                    )
+                    break
+
+    mean_rew = float(np.mean([h["mean_reward"] for h in history[-10:]]))
+    logger.info("Training complete. Mean reward (last 10 episodes): %.4f", mean_rew)
+    
     # Inference — collect per-window scores 
     logger.info("Inference on TRAIN windows …")
     (train_mean_scores,

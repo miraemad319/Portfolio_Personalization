@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -190,12 +191,21 @@ class RLAssetSelectorAgent:
         feature_dim:   int,
         hidden_dims:   Optional[List[int]] = None,
         lr:            float = 3e-4,
-        gamma:         float = 0.99,
-        gae_lambda:    float = 0.95,
+        gamma:         float = 0.0,   # FIX 2: was 0.99. Each env step is an
+                                      # independent ranking problem — the action
+                                      # at step t does not causally affect the
+                                      # state at t+1, so discounting future
+                                      # rewards creates false long-range
+                                      # dependencies the critic cannot model.
+                                      # gamma=0 → advantage = r_t - V(s_t).
+        gae_lambda:    float = 0.0,   # FIX 2: was 0.95. Irrelevant when
+                                      # gamma=0 but set explicitly for clarity.
         clip_eps:      float = 0.2,
         ppo_epochs:    int   = 10,
         value_coeff:   float = 0.5,
-        entropy_coeff: float = 0.05,
+        entropy_coeff: float = 0.0,   # FIX 4: was 0.05. See _ppo_update for
+                                      # explanation — entropy is replaced by
+                                      # the diversity_loss on mean scores.
         device:        str   = "cpu",
     ) -> None:
         if hidden_dims is None:
@@ -217,7 +227,6 @@ class RLAssetSelectorAgent:
             {"params": self.actor.parameters(),  "lr": lr},
             {"params": self.critic.parameters(), "lr": lr * 3},
         ])
-        self._scheduler: Optional[optim.lr_scheduler.CosineAnnealingLR] = None
 
     # Supervised pretraining
 
@@ -237,14 +246,23 @@ class RLAssetSelectorAgent:
         X_list: List[np.ndarray] = []
         y_list: List[np.ndarray] = []
 
-        # iter_all_windows with no args uses [_start_idx, _end_idx) by default,
+        # iter_all_windows with no args uses [_start_idx, _end_idx) by default.
+        # FIX 1: compute percentile rank of fwd_vol WITHIN each window before
+        # appending, so the pretraining target is a [0,1] rank — consistent with
+        # the Spearman rank-correlation reward used in PPO.  The old approach
+        # normalised vol globally across all windows, which created a
+        # time-regime signal (high vol era vs low vol era) unrelated to the
+        # cross-sectional ranking the agent actually needs to learn.
         for _date, obs, idx, valid_mask in env.iter_all_windows():
             fwd_vol = env._compute_forward_vol(idx)
             valid   = valid_mask & np.isfinite(fwd_vol)
             if valid.sum() < 3:
                 continue
+            # Rank within this window: 0.0 = lowest vol, 1.0 = highest vol
+            vol_valid = fwd_vol[valid]
+            ranks = pd.Series(vol_valid).rank(pct=True).values.astype(np.float32)
             X_list.append(obs[valid])
-            y_list.append(fwd_vol[valid])
+            y_list.append(ranks)
 
         if not X_list:
             logger.warning("Pretraining: no valid pairs found — skipping.")
@@ -252,15 +270,13 @@ class RLAssetSelectorAgent:
 
         X = np.concatenate(X_list, axis=0)
         y = np.concatenate(y_list, axis=0)
-
-        y_min, y_max = float(np.nanmin(y)), float(np.nanmax(y))
-        y_norm = (y - y_min) / (y_max - y_min + 1e-8)
+        # y is already in [0, 1] — no further normalisation needed
 
         X_t = torch.nan_to_num(
             torch.tensor(X, dtype=torch.float32).to(self.device),
             nan=0.0, posinf=0.0, neginf=0.0,
         )
-        y_t = torch.tensor(y_norm, dtype=torch.float32).to(self.device)
+        y_t = torch.tensor(y, dtype=torch.float32).to(self.device)
 
         pre_opt = optim.Adam(self.actor.parameters(), lr=lr_pretrain)
         mse     = nn.MSELoss()
@@ -284,22 +300,45 @@ class RLAssetSelectorAgent:
 
     # PPO training 
 
+    def train_one_episode(self, env) -> Dict:
+        """
+        Run a single PPO episode and return its stats dict.
+
+        Used by the early-stopping loop in asset_selector.classify_assets()
+        so the caller controls the episode loop and can break at any time.
+        The internal train() method still exists for callers that want the
+        simple fixed-episode interface.
+        """
+        rollout                      = self._collect_rollout(env)
+        loss, actor_loss, value_loss = self._ppo_update(rollout)
+        rewards = rollout["rewards"]
+
+        rewards = rollout["rewards"]
+        return {
+            "mean_reward":  float(np.mean(rewards)),
+            "total_reward": float(np.sum(rewards)),
+            "loss":         loss,
+            "actor_loss":   actor_loss,
+            "value_loss":   value_loss,
+        }
+
     def train(
         self,
         env,
         n_episodes: int = 150,
         log_every:  int = 10,
     ) -> List[Dict]:
-        
-        self._scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=n_episodes, eta_min=1e-5,
-        )
+        # FIX 3: cosine LR scheduler removed.  The original CosineAnnealingLR
+        # with a single eta_min applied the same floor to both param groups,
+        # collapsing the 3× actor/critic LR ratio established in __init__.
+        # For 150–300 episodes on a small dataset, a fixed LR is simpler and
+        # avoids that instability.  If you want to add LR decay later, use
+        # separate schedulers per param group with matching eta_min ratios.
         history: List[Dict] = []
 
         for ep in range(1, n_episodes + 1):
             rollout                      = self._collect_rollout(env)
             loss, actor_loss, value_loss = self._ppo_update(rollout)
-            self._scheduler.step()
 
             rewards = rollout["rewards"]
             stats = {
@@ -429,41 +468,55 @@ class RLAssetSelectorAgent:
         actor_losses: List[float] = []
         value_losses: List[float] = []
 
-        for _ in range(self.ppo_epochs):
-            new_log_probs, entropy = self.actor.evaluate_actions(
-                obs_batch, actions_batch
-            )
+        for epoch_idx in range(self.ppo_epochs):
+            # FIX 5 (minibatch shuffling) is applied inside this loop — see below.
+            # We re-shuffle each epoch so the model never sees the same
+            # temporal ordering twice within a single PPO update.
+            T = obs_batch.shape[0]
+            mb_size = min(32, T)
+            indices = torch.randperm(T, device=self.device)
 
-            ratio   = torch.exp(new_log_probs - old_log_probs)
-            clipped = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps)
-            actor_loss = -torch.min(ratio * adv_t, clipped * adv_t).mean()
+            epoch_total:  List[float] = []
+            epoch_actor:  List[float] = []
+            epoch_value:  List[float] = []
 
-            mean_scores_batch, _ = self.actor(obs_batch) #encourage actor to spread predictions
-            score_var = mean_scores_batch.var(dim=-1).mean()
-            diversity_loss = -0.01 * score_var
+            for start in range(0, T, mb_size):
+                mb_idx = indices[start : start + mb_size]
 
+                new_log_probs, _ = self.actor.evaluate_actions(
+                    obs_batch[mb_idx], actions_batch[mb_idx]
+                )
 
-            values_pred = self.critic(obs_batch)   # (T,)
-            value_loss  = F.mse_loss(values_pred, ret_t)
+                ratio   = torch.exp(new_log_probs - old_log_probs[mb_idx])
+                clipped = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps)
+                actor_loss = -torch.min(ratio * adv_t[mb_idx], clipped * adv_t[mb_idx]).mean()
 
-            loss = (
-                actor_loss
-                + self.value_coeff   * value_loss
-                - self.entropy_coeff * entropy
-                + diversity_loss
-            )
+        
+                mean_scores_mb, _ = self.actor(obs_batch[mb_idx])
+                score_var      = mean_scores_mb.var(dim=-1).mean()
+                diversity_loss = -0.05 * score_var  
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(
-                list(self.actor.parameters()) + list(self.critic.parameters()),
-                max_norm=0.5,
-            )
-            self.optimizer.step()
+                values_pred = self.critic(obs_batch[mb_idx])
+                value_loss  = F.mse_loss(values_pred, ret_t[mb_idx])
 
-            total_losses.append(float(loss.detach()))
-            actor_losses.append(float(actor_loss.detach()))
-            value_losses.append(float(value_loss.detach()))
+              
+                loss = actor_loss + self.value_coeff * value_loss + diversity_loss
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(
+                    list(self.actor.parameters()) + list(self.critic.parameters()),
+                    max_norm=0.5,
+                )
+                self.optimizer.step()
+
+                epoch_total.append(float(loss.detach()))
+                epoch_actor.append(float(actor_loss.detach()))
+                epoch_value.append(float(value_loss.detach()))
+
+            total_losses.append(float(np.mean(epoch_total)))
+            actor_losses.append(float(np.mean(epoch_actor)))
+            value_losses.append(float(np.mean(epoch_value)))
 
         return (
             float(np.mean(total_losses)),
@@ -564,7 +617,8 @@ class RLAssetSelectorAgent:
                 continue
 
             score_arr   = np.stack(scores_in_q, axis=0)
-            mean_scores = np.nanmean(score_arr, axis=0)
+            with np.errstate(all="ignore"):  # suppress Mean of empty slice warning
+                mean_scores = np.nanmean(score_arr, axis=0)
             mean_scores[np.isfinite(score_arr).sum(axis=0) < 1] = np.nan
 
             cluster_ids, risk_profiles = env.assign_clusters(
