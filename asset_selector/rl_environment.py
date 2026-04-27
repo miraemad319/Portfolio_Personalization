@@ -615,11 +615,8 @@ class AssetSelectorEnv(gym.Env):
         if thresholds is not None:
             t_low, t_high = thresholds
         else:
-            logger.warning(
-                "assign_clusters called without thresholds — "
-                "falling back to tertile split of current scores. "
-                "This should only happen during testing or debugging."
-            )
+            # Per-quarter tertile split — thresholds derived from this
+           
             t_low  = float(np.percentile(scores, 33.3))
             t_high = float(np.percentile(scores, 66.7))
 

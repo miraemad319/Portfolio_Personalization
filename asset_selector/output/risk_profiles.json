@@ -26,6 +26,8 @@
     "ARAB",
     "CICH",
     "CIRA",
+    "CLHO",
+    "DSCW",
     "EAST",
     "EGTS",
     "EMFD",
@@ -33,10 +35,13 @@
     "FWRY",
     "HELI",
     "HRHO",
+    "ISPH",
     "JUFO",
     "MTIE",
+    "PHDC",
     "QNBE",
-    "RMDA"
+    "RMDA",
+    "TALM"
   ],
   "aggressive": [
     "ARCC",
@@ -44,8 +49,6 @@
     "BINV",
     "BTFH",
     "CCAP",
-    "CLHO",
-    "DSCW",
     "EFID",
     "EFIH",
     "EGAL",
@@ -53,17 +56,14 @@
     "GBCO",
     "GDWA",
     "IRON",
-    "ISPH",
     "MCQE",
     "OCDI",
     "OFH",
     "OIH",
     "ORHD",
     "PHAR",
-    "PHDC",
     "PRDC",
-    "RAYA",
-    "TALM"
+    "RAYA"
   ],
   "as_of_quarter": "2025-11-03"
 }

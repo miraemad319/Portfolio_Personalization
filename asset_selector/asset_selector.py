@@ -224,91 +224,15 @@ def classify_assets(
         fwd_ret_matrix = train_fwd_ret_matrix
         mean_scores    = train_mean_scores
 
-    # Threshold derivation — score training windows without thresholds first
-    logger.info("Quarterly scoring on TRAIN windows (threshold derivation) …")
-    train_quarterly = agent.collect_quarterly_scores(
-        env,
-        start_idx  = env._start_idx,
-        end_idx    = env._end_idx,
-        thresholds = None,
-    )
 
-    train_q_score_matrix = np.stack(
-        [q["mean_scores"] for q in train_quarterly], axis=0
-    )
-    with np.errstate(all="ignore"):
-        train_q_mean_per_ticker = np.nanmean(train_q_score_matrix, axis=0)
-
-    valid_train_q_means = train_q_mean_per_ticker[
-        np.isfinite(train_q_mean_per_ticker)
-    ]
-    if len(valid_train_q_means) < 3:
-        raise ValueError(
-            "Too few valid training quarterly scores to compute thresholds."
-        )
-
-    # Primary method: percentile-based thresholds on training scores.
-    # These guarantee ~equal thirds of the training ticker population
-    # regardless of score distribution shape.
-    t_low  = float(np.percentile(valid_train_q_means, 33.3))
-    t_high = float(np.percentile(valid_train_q_means, 66.7))
-
-    # KDE check: if the distribution has clear natural gaps (bimodal),
-    # prefer the valley boundaries as they reflect genuine risk clusters.
-    # Only use KDE boundaries when both valleys are well-separated from
-    # the percentile boundaries (> 0.5 score units away from t_low/t_high).
-    grid    = np.linspace(valid_train_q_means.min(), valid_train_q_means.max(), 500)
-    kde     = gaussian_kde(valid_train_q_means, bw_method=0.3)
-    density = kde(grid)
-    valleys = [
-        i for i in range(1, len(density) - 1)
-        if density[i] < density[i - 1] and density[i] < density[i + 1]
-    ]
-
-    if len(valleys) >= 2:
-        valleys_by_depth  = sorted(valleys, key=lambda i: density[i])
-        two_deepest       = sorted(valleys_by_depth[:2])
-        kde_t_low  = float(grid[two_deepest[0]])
-        kde_t_high = float(grid[two_deepest[1]])
-        # Only accept KDE boundaries if they differ meaningfully from percentiles
-        # and the resulting balanced tier has at least 10% of tickers
-        n_balanced_kde = int(
-            ((valid_train_q_means >= kde_t_low) &
-             (valid_train_q_means < kde_t_high)).sum()
-        )
-        if n_balanced_kde >= max(3, int(0.10 * len(valid_train_q_means))):
-            t_low, t_high = kde_t_low, kde_t_high
-            logger.info(
-                "Classification thresholds (KDE valley detection, "
-                "%d tickers, %d balanced): t_low=%.4f  t_high=%.4f",
-                len(valid_train_q_means), n_balanced_kde, t_low, t_high,
-            )
-        else:
-            logger.info(
-                "KDE valleys found but balanced tier too thin (%d tickers) — "
-                "using percentile thresholds instead.",
-                n_balanced_kde,
-            )
-            logger.info(
-                "Classification thresholds (percentile, %d tickers): "
-                "t_low=%.4f  t_high=%.4f",
-                len(valid_train_q_means), t_low, t_high,
-            )
-    else:
-        logger.info(
-            "Classification thresholds (percentile, %d tickers): "
-            "t_low=%.4f  t_high=%.4f",
-            len(valid_train_q_means), t_low, t_high,
-        )
-    thresholds = (t_low, t_high)
-
-    # Re-run quarterly inference with correct thresholds
+    # Quarterly inference — per-quarter tertile thresholds, matching
+    # the evaluation which also uses per-quarter tertiles of actual vol.
     logger.info("Quarterly inference on TRAIN windows …")
     train_quarterly = agent.collect_quarterly_scores(
         env,
         start_idx  = env._start_idx,
         end_idx    = env._end_idx,
-        thresholds = thresholds,
+        thresholds = None,
     )
     for q in train_quarterly:
         q["split"] = "train"
@@ -319,12 +243,10 @@ def classify_assets(
             env,
             start_idx  = env._test_start_idx,
             end_idx    = env._full_end_idx,
-            thresholds = thresholds,
+            thresholds = None,
         )
         for q in test_quarterly:
             q["split"] = "test"
-    else:
-        test_quarterly = []
 
     quarterly_data = train_quarterly + test_quarterly
 
