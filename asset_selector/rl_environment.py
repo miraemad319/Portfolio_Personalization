@@ -11,207 +11,231 @@ from scipy.stats import spearmanr
 logger = logging.getLogger(__name__)
 
 TRADING_DAYS = 252
+
 FEATURE_NAMES = [
-    # --- original 13 features ---
-    "realised_vol",
-    "mean_return",
-    "sharpe",
-    "max_drawdown",
-    "skewness",
-    "excess_kurtosis",
-    "momentum_21",
-    "momentum_63",
-    "vol_trend",
-    "downside_vol",
-    "beta",
-    "volume_trend",
-    "volume_shock",
-    # --- 5 new features ---
-    "vol_of_vol",         # std of rolling 21d vol — measures vol stability
-    "vol_autocorr",       # lag-1 autocorr of squared returns — GARCH persistence signal
-    "market_stress",      # ticker vol / cross-sectional median vol — regime position
-    "pain_index",         # mean drawdown depth over window — smoother than max_dd
-    "return_consistency", # fraction of positive-return days — orthogonal behavioural signal
+    "realised_vol",        # annualised historical vol — HAR monthly proxy
+    "momentum_63",         # 3-month price momentum
+    "vol_trend",           # recent 21d vol / full-window vol
+    "downside_vol",        # semi-deviation — asymmetric risk
+    "beta",                # systematic risk vs equal-weight market proxy
+    "volume_trend",        # recent 21d mean volume / full-window mean
+    "volume_shock",        # max volume / median volume — liquidity spike
+    "vol_of_vol",          # std of rolling 21d vol — vol stability
+    "vol_autocorr",        # lag-1 autocorr of squared returns — GARCH persistence
+    "market_stress",       # ticker vol / cross-sectional median vol
+    "pain_index",          # mean drawdown depth
+    "return_consistency",  # fraction of positive-return days
+    "rv_daily",            # HAR daily: last day squared return annualised
+    "rv_weekly",           # HAR weekly: mean of last 5 daily RVs annualised
+    "cvar_95",             # CVaR 95%: mean return in worst 5% of days annualised
+    "rolling_mdd_21",      # 21-day rolling max drawdown
+    "downside_beta",       # beta on market-down days only
+    "vol_percentile_rank", # cross-sectional percentile rank of realised vol
+    "amihud_illiquidity",  # mean |return| / volume
+    "atr_ratio",           # ATR / close — normalised average true range
 ]
 
-# Feature helpers
 
+#  Feature computation 
 
 def _window_features(
-    ret_window: pd.DataFrame,
-    px_window: pd.DataFrame,
-    vol_window: pd.DataFrame,
+    ohlcv_window: pd.DataFrame,
+    ret_window:   pd.DataFrame,
 ) -> np.ndarray:
-    """
-    Compute a (n_tickers, 18) feature matrix for one time window.
-
-    Parameters
-    ret_window : pd.DataFrame
-        Daily log returns for the lookback window.
-    px_window : pd.DataFrame
-        Close prices for the same window.
-    vol_window : pd.DataFrame  Daily volume for the same window.
-
-    Returns
-    np.ndarray shape (n_tickers, 18), dtype float32.
-    NaN for tickers with fewer than 5 valid returns.
-    Original 13 features + 5 new: vol_of_vol, vol_autocorr,
-    market_stress, pain_index, return_consistency.
-    """
+    
     n_features = len(FEATURE_NAMES)
-    tickers = ret_window.columns.tolist()
+    tickers    = ret_window.columns.tolist()
+
+    # Pre-compute equal-weight market return once per window
+    market_ret_all: Dict[str, pd.Series] = {
+        ticker: ret_window[[c for c in tickers if c != ticker]].mean(axis=1)
+        for ticker in tickers
+    }
+
     rows: List[List[float]] = []
 
     for ticker in tickers:
         ret = ret_window[ticker].dropna()
-        px  = px_window[ticker].dropna()
-        volume_series = vol_window[ticker].replace(0.0, np.nan).dropna()
         n   = len(ret)
 
         if n < 5:
             rows.append([np.nan] * n_features)
             continue
 
-        # Core risk features 
-        vol      = float(ret.std() * np.sqrt(TRADING_DAYS))
-        mean_ret = float(ret.mean() * TRADING_DAYS)
-        sharpe   = float(mean_ret / vol) if vol > 1e-8 else 0.0
+        # Extract per-ticker OHLCV series from the MultiIndex window
+        t_data = ohlcv_window[ticker]
+        px     = t_data["close"].dropna()
+        high   = t_data["high"].dropna()
+        low    = t_data["low"].dropna()
+        volume = t_data["volume"].replace(0.0, np.nan).dropna()
 
-        # Drawdown: exp(cumsum) is exact for log returns
-        # Guard checks len(ret) not len(px) — ret drives the calculation
-        if n > 2:
-            cum      = np.exp(ret.cumsum())
-            roll_max = cum.cummax()
-            dd       = (cum - roll_max) / roll_max
-            max_dd   = float(abs(dd.min()))
-        else:
-            max_dd = np.nan
+        #  1. Realised vol (HAR monthly proxy) 
+        vol = float(ret.std() * np.sqrt(TRADING_DAYS))
 
-        skew = float(ret.skew()) if n > 4 else np.nan
-        kurt = float(ret.kurt()) if n > 4 else np.nan
+        #  2. 3-month momentum 
+        mom_63 = (
+            float((px.iloc[-1] / px.iloc[-64]) - 1.0)
+            if len(px) >= 64 and px.iloc[-64] > 0 else np.nan
+        )
 
-        # Momentum features 
-        if len(px) >= 22 and px.iloc[-22] > 0:
-            mom_21 = float((px.iloc[-1] / px.iloc[-22]) - 1.0)
-        else:
-            mom_21 = np.nan
+        #  3. Vol trend: recent 21d vol / full-window vol 
+        vol_trend = (
+            float(ret.iloc[-21:].std() * np.sqrt(TRADING_DAYS) / vol)
+            if n >= 21 and vol > 1e-8 else np.nan
+        )
 
-        if len(px) >= 64 and px.iloc[-64] > 0:
-            mom_63 = float((px.iloc[-1] / px.iloc[-64]) - 1.0)
-        else:
-            mom_63 = np.nan
-
-        # Volatility trend 
-        if n >= 21:
-            recent_vol = float(ret.iloc[-21:].std() * np.sqrt(TRADING_DAYS))
-            vol_trend  = float(recent_vol / vol) if vol > 1e-8 else np.nan
-        else:
-            vol_trend = np.nan
-
-        # Downside volatility 
+        #  4. Downside volatility 
         neg_ret      = ret[ret < 0]
         downside_vol = (
             float(neg_ret.std() * np.sqrt(TRADING_DAYS))
             if len(neg_ret) >= 5 else np.nan
         )
 
-        # Beta (self-exclusion to remove ~1/N bias) 
-        other_cols = [c for c in ret_window.columns if c != ticker]
-        market_ret = ret_window[other_cols].mean(axis=1)
+        #  5 & 17. Beta and downside beta 
+        market_ret = market_ret_all[ticker]
         common_idx = ret.index.intersection(market_ret.dropna().index)
+        beta = downside_beta = np.nan
         if len(common_idx) >= 10:
             r_t     = ret.loc[common_idx].values
             m_t     = market_ret.loc[common_idx].values
-            cov_mat = np.cov(r_t, m_t)          # ddof=1 for both
+            cov_mat = np.cov(r_t, m_t)
             m_var   = float(cov_mat[1, 1])
-            beta    = float(cov_mat[0, 1] / m_var) if m_var > 1e-10 else np.nan
-        else:
-            beta = np.nan
+            if m_var > 1e-10:
+                beta = float(cov_mat[0, 1] / m_var)
+            down_mask = m_t < 0
+            if down_mask.sum() >= 10:
+                cov_d   = np.cov(r_t[down_mask], m_t[down_mask])
+                m_var_d = float(cov_d[1, 1])
+                if m_var_d > 1e-10:
+                    downside_beta = float(cov_d[0, 1] / m_var_d)
 
-        #vol trends
-        if len(volume_series) >= 21:
-            recent_mean_vol = float(volume_series.iloc[-21:].mean())
-            full_mean_vol   = float(volume_series.mean())
-            volume_trend    = (
-                float(recent_mean_vol / full_mean_vol)
-                if full_mean_vol > 1e-8 else np.nan
-            )
-        else:
-            volume_trend = np.nan
+        #  6. Volume trend 
+        volume_trend = np.nan
+        if len(volume) >= 21:
+            full_mean = float(volume.mean())
+            if full_mean > 1e-8:
+                volume_trend = float(volume.iloc[-21:].mean() / full_mean)
 
-        #vol shock
-        if len(volume_series) >= 10:
-            median_vol   = float(volume_series.median())
-            max_vol      = float(volume_series.max())
-            volume_shock = (
-                float(max_vol / median_vol)
-                if median_vol > 1e-8 else np.nan
-            )
-        else:
-            volume_shock = np.nan
+        #  7. Volume shock 
+        volume_shock = np.nan
+        if len(volume) >= 10:
+            median_v = float(volume.median())
+            if median_v > 1e-8:
+                volume_shock = float(volume.max() / median_v)
 
-        rows.append([
-            vol, mean_ret, sharpe, max_dd, skew, kurt,
-            mom_21, mom_63, vol_trend, downside_vol, beta, volume_trend, volume_shock,
-            np.nan, np.nan, np.nan, np.nan, np.nan,  # placeholders for new features
-        ])
-
-    feat_matrix = np.array(rows, dtype=np.float32)  # shape (n_tickers, 18)
-
-    # ── Compute the 5 new features ────────────────────────────────────────────
-    # Index offsets for the placeholder columns:
-    IDX_VOL_OF_VOL    = 13
-    IDX_VOL_AUTOCORR  = 14
-    IDX_MARKET_STRESS = 15
-    IDX_PAIN_INDEX    = 16
-    IDX_CONSISTENCY   = 17
-
-    # Cross-sectional median realised_vol (column 0) for market_stress
-    all_vols = feat_matrix[:, 0]  # realised_vol per ticker
-    valid_vols = all_vols[np.isfinite(all_vols)]
-    cross_median_vol = float(np.median(valid_vols)) if len(valid_vols) >= 3 else np.nan
-
-    for i, ticker in enumerate(tickers):
-        ret = ret_window[ticker].dropna()
-        n   = len(ret)
-
-        if n < 5:
-            # All new features stay NaN — already set above
-            continue
-
-        # vol_of_vol: std of rolling 21-day annualised vol
-        # Requires at least 42 observations to get 2+ non-NaN rolling windows
+        #  8. Vol of vol 
+        vol_of_vol = np.nan
         if n >= 42:
-            roll_vol = (
-                ret.rolling(21).std().dropna() * np.sqrt(TRADING_DAYS)
-            )
-            feat_matrix[i, IDX_VOL_OF_VOL] = float(roll_vol.std()) if len(roll_vol) >= 2 else np.nan
-        # else: stays NaN
+            roll_vol = ret.rolling(21).std().dropna() * np.sqrt(TRADING_DAYS)
+            if len(roll_vol) >= 2:
+                vol_of_vol = float(roll_vol.std())
 
-        # vol_autocorr: lag-1 autocorrelation of squared returns
-        # Squared returns are the standard proxy for variance in GARCH literature
+        #  9. Vol autocorr 
+        vol_autocorr = np.nan
         if n >= 10:
             sq_ret = ret.values ** 2
             if sq_ret.std() > 1e-10:
-                autocorr = float(np.corrcoef(sq_ret[:-1], sq_ret[1:])[0, 1])
-                feat_matrix[i, IDX_VOL_AUTOCORR] = autocorr if np.isfinite(autocorr) else np.nan
+                ac = float(np.corrcoef(sq_ret[:-1], sq_ret[1:])[0, 1])
+                vol_autocorr = ac if np.isfinite(ac) else np.nan
 
-        # market_stress: this ticker's vol relative to cross-sectional median
-        # > 1.0 means this stock is more volatile than the median today
-        ticker_vol = feat_matrix[i, 0]  # realised_vol already computed
-        if np.isfinite(ticker_vol) and np.isfinite(cross_median_vol) and cross_median_vol > 1e-8:
-            feat_matrix[i, IDX_MARKET_STRESS] = ticker_vol / cross_median_vol
-
-        # pain_index: mean of the drawdown series (not just the worst point)
-        # Gives a smoother picture of how much time the stock spent underwater
+        #  11. Pain index 
+        pain_index = np.nan
         if n > 2:
-            cum      = np.exp(ret.cumsum())
-            roll_max = cum.cummax()
-            dd_series = (cum - roll_max) / roll_max  # always <= 0
-            feat_matrix[i, IDX_PAIN_INDEX] = float(abs(dd_series.mean()))
+            cum       = np.exp(ret.cumsum())
+            rollmax   = cum.cummax()
+            pain_index = float(abs(((cum - rollmax) / rollmax).mean()))
 
-        # return_consistency: fraction of trading days with positive returns
-        feat_matrix[i, IDX_CONSISTENCY] = float((ret > 0).sum() / n)
+        #  12. Return consistency 
+        return_consistency = float((ret > 0).sum() / n)
+
+        #  13. HAR daily 
+        rv_daily = float(ret.iloc[-1] ** 2 * TRADING_DAYS)
+
+        #  14. HAR weekly 
+        rv_weekly = float((ret.iloc[-5:] ** 2).mean() * TRADING_DAYS)
+
+        #  15. CVaR 95% 
+        cvar_95 = np.nan
+        if n >= 20:
+            tail = ret[ret <= ret.quantile(0.05)]
+            if len(tail) >= 1:
+                cvar_95 = float(tail.mean() * TRADING_DAYS)
+
+        #  16. Rolling 21d max drawdown 
+        rolling_mdd_21 = np.nan
+        if n >= 21:
+            r21     = ret.iloc[-21:]
+            cum21   = np.exp(r21.cumsum())
+            dd21    = (cum21 - cum21.cummax()) / cum21.cummax()
+            rolling_mdd_21 = float(abs(dd21.min()))
+
+        #  19. Amihud illiquidity 
+        amihud = np.nan
+        if len(volume) >= 10:
+            common_v = ret.index.intersection(volume.index)
+            if len(common_v) >= 10:
+                illiq = (
+                    ret.loc[common_v].abs() / volume.loc[common_v]
+                ).replace([np.inf, -np.inf], np.nan).dropna()
+                if len(illiq) >= 5:
+                    amihud = float(illiq.mean())
+
+        #  20. ATR ratio: mean true range / close 
+        atr_ratio = np.nan
+        common_hl = high.index.intersection(low.index).intersection(px.index)
+        if len(common_hl) >= 5:
+            h  = high.loc[common_hl]
+            l  = low.loc[common_hl]
+            c  = px.loc[common_hl]
+            c_prev = c.shift(1).dropna()
+            common_atr = c_prev.index.intersection(h.index)
+            if len(common_atr) >= 5:
+                hl  = h.loc[common_atr] - l.loc[common_atr]
+                hpc = (h.loc[common_atr] - c_prev.loc[common_atr]).abs()
+                lpc = (l.loc[common_atr] - c_prev.loc[common_atr]).abs()
+                tr  = pd.concat([hl, hpc, lpc], axis=1).max(axis=1)
+                last_close = float(c.iloc[-1])
+                if last_close > 1e-8:
+                    atr_ratio = float(tr.mean() / last_close)
+
+        rows.append([
+            vol, mom_63, vol_trend, downside_vol,
+            beta, volume_trend, volume_shock,
+            vol_of_vol, vol_autocorr,
+            np.nan,             # market_stress — filled post-loop
+            pain_index, return_consistency,
+            rv_daily, rv_weekly, cvar_95,
+            rolling_mdd_21, downside_beta,
+            np.nan,             # vol_percentile_rank — filled post-loop
+            amihud, atr_ratio,
+        ])
+
+    feat_matrix = np.array(rows, dtype=np.float32)  # (n_tickers, 20)
+
+    #  Cross-sectional features (require all tickers to be scored first) 
+    IDX_MARKET_STRESS  = 9
+    IDX_VOL_PERCENTILE = 17
+
+    all_vols        = feat_matrix[:, 0]
+    finite_vol_mask = np.isfinite(all_vols)
+    valid_vols      = all_vols[finite_vol_mask]
+
+    if len(valid_vols) >= 3:
+        cross_median_vol = float(np.median(valid_vols))
+
+        # market_stress: ticker vol / cross-sectional median
+        if cross_median_vol > 1e-8:
+            feat_matrix[:, IDX_MARKET_STRESS] = np.where(
+                finite_vol_mask,
+                all_vols / cross_median_vol,
+                np.nan,
+            )
+
+        # vol_percentile_rank: cross-sectional percentile rank [0, 1]
+        vol_ranks = pd.Series(all_vols).rank(pct=True).values.astype(np.float32)
+        feat_matrix[:, IDX_VOL_PERCENTILE] = np.where(
+            finite_vol_mask, vol_ranks, np.nan
+        )
 
     return feat_matrix
 
@@ -220,8 +244,6 @@ def _zscore_normalise(X: np.ndarray) -> np.ndarray:
     """
     Cross-sectional z-score: normalise each feature column across tickers.
     Columns that are entirely NaN or have zero std are set to 0.
-    No cross-time information is introduced — only the ~60 tickers at
-    this single time step are used to compute mean and std.
     """
     out = np.zeros_like(X)
     for j in range(X.shape[1]):
@@ -235,7 +257,8 @@ def _zscore_normalise(X: np.ndarray) -> np.ndarray:
         out[:, j] = np.where(np.isfinite(col), (col - mu) / sigma, 0.0)
     return out
 
-# Environment
+
+#  Environment 
 
 class AssetSelectorEnv(gym.Env):
 
@@ -243,75 +266,71 @@ class AssetSelectorEnv(gym.Env):
 
     def __init__(
         self,
-        prices:        pd.DataFrame,
-        volume:        Optional[pd.DataFrame] = None,
+        ohlcv:         pd.DataFrame,
         lookback:      int           = 126,
         forward:       int           = 63,
         step_size:     int           = 21,
         n_clusters:    int           = 3,
         train_end_idx: Optional[int] = None,
     ) -> None:
+        """
+        Parameters
+        ----------
+        ohlcv : pd.DataFrame
+            MultiIndex columns (ticker, price_type).
+            price_type ∈ {open, high, low, close, volume}.
+            DatetimeIndex rows, daily frequency.
+        """
         super().__init__()
 
-        self.prices      = prices.replace(0.0, np.nan)
-        self.tickers     = list(prices.columns)
-        self.n_tickers   = len(self.tickers)
-        self.lookback    = lookback
-        self.forward     = forward
-        self.step_size   = step_size
+        #  Extract tickers and validate structure 
+        self.tickers   = sorted(ohlcv.columns.get_level_values("ticker").unique().tolist())
+        self.n_tickers = len(self.tickers)
+        self.lookback  = lookback
+        self.forward   = forward
+        self.step_size = step_size
         self.n_clusters  = n_clusters
         self.feature_dim = len(FEATURE_NAMES)
 
-        # Volume: replace 0.0 and NaN with NaN for clean ratio computation
-        if volume is not None:
-            self.volume: pd.DataFrame = (
-                volume.replace(0.0, np.nan)
-                .reindex(index=self.prices.index, columns=self.tickers)
-            )
-        else:
-            self.volume = pd.DataFrame(
-                np.nan, index=self.prices.index, columns=self.tickers
-            )
+        # Store the full OHLCV MultiIndex DataFrame 
+        self.ohlcv = ohlcv
 
-        # Pre-compute log returns once — 0.0 already replaced above
+        #  Derive close prices and log returns 
+        # Close is used for forward vol/return/drawdown evaluation and
+        # for the date index. All other price types are used only in features.
+        self.prices: pd.DataFrame = (
+            ohlcv.xs("close", axis=1, level="price_type")
+            .replace(0.0, np.nan)
+            .reindex(columns=self.tickers)
+        )
+
         self.log_returns: pd.DataFrame = np.log(
             self.prices / self.prices.shift(1)
         )
 
         # Index landmarks 
-        # First valid step: need a full lookback window
-        self._start_idx = lookback
-
-        # Last valid step overall: a step at idx reads [idx, idx+forward).
-        # The slice is valid as long as idx + forward <= len(prices),
-        # i.e. idx <= len(prices) - forward.
-        self._full_end_idx = len(prices) - forward
+        self._start_idx    = lookback
+        self._full_end_idx = len(self.prices) - forward
 
         if train_end_idx is not None:
-            # _end_idx is the PPO episode boundary.
-            # A step at idx uses forward data [idx, idx+forward).
-            # To avoid leaking test data into training, the last training step must satisfy: idx + forward <= train_end_idx
-            # Therefore: idx <= train_end_idx - forward
-            self._train_end_idx  = int(train_end_idx)
-            self._end_idx        = min(
+            self._train_end_idx        = int(train_end_idx)
+            self._end_idx              = min(
                 self._train_end_idx - self.forward,
                 self._full_end_idx,
             )
-            # Test period starts immediately after the training boundary
             self._test_start_idx: Optional[int] = self._train_end_idx + 1
         else:
-            self._train_end_idx  = self._full_end_idx + self.forward  # sentinel
+            self._train_end_idx  = self._full_end_idx + self.forward
             self._end_idx        = self._full_end_idx
             self._test_start_idx = None
 
         if self._end_idx <= self._start_idx:
             raise ValueError(
-                f"Training period too short after applying lookback={lookback} "
-                f"and forward={forward} constraints. "
-                f"Got _start_idx={self._start_idx}, _end_idx={self._end_idx}."
+                f"Training period too short: lookback={lookback} forward={forward} "
+                f"→ _start_idx={self._start_idx} _end_idx={self._end_idx}."
             )
 
-        # Gymnasium spaces
+        # Gymnasium spaces 
         self.observation_space = gym.spaces.Box(
             low=-10.0, high=10.0,
             shape=(self.n_tickers, self.feature_dim),
@@ -329,18 +348,16 @@ class AssetSelectorEnv(gym.Env):
         logger.info(
             "AssetSelectorEnv: %d tickers  %d rows  "
             "lookback=%d  forward=%d  step=%d",
-            self.n_tickers, len(prices), lookback, forward, step_size,
+            self.n_tickers, len(self.prices), lookback, forward, step_size,
         )
         logger.info(
             "Index landmarks: start=%d  train_end=%d  "
             "test_start=%s  full_end=%d",
-            self._start_idx,
-            self._end_idx,
-            str(self._test_start_idx),
-            self._full_end_idx,
+            self._start_idx, self._end_idx,
+            str(self._test_start_idx), self._full_end_idx,
         )
 
-    # Gymnasium interface 
+    #  Gymnasium interface 
 
     def reset(
         self,
@@ -394,9 +411,8 @@ class AssetSelectorEnv(gym.Env):
 
     def _get_valid_mask(self, idx: int) -> np.ndarray:
         """
-        Bool array (n_tickers,) — True where ticker has >= 5 log returns
-        in the lookback window ending at idx.
-        Excludes tickers whose observation is all-zero (delisting marker).
+        Bool array (n_tickers,) — True where ticker has >= 5 valid log
+        returns in the lookback window [idx-lookback, idx).
         """
         ret_win = self.log_returns.iloc[idx - self.lookback : idx]
         return np.array(
@@ -409,13 +425,12 @@ class AssetSelectorEnv(gym.Env):
         Build the (n_tickers, feature_dim) observation for window ending at idx.
         Uses only data in [idx-lookback, idx) — strictly past-only.
         """
-        ret_win = self.log_returns.iloc[idx - self.lookback : idx]
-        px_win  = self.prices.iloc[idx - self.lookback : idx]
-        vol_win = self.volume.iloc[idx - self.lookback : idx]
-        raw     = _window_features(ret_win, px_win, vol_win)
+        ohlcv_win = self.ohlcv.iloc[idx - self.lookback : idx]
+        ret_win   = self.log_returns.iloc[idx - self.lookback : idx]
+        raw       = _window_features(ohlcv_win, ret_win)
         return _zscore_normalise(raw).astype(np.float32)
 
-    # Forward metrics (reward and evaluation) 
+    # Forward metrics 
 
     def _compute_forward_vol(self, idx: int) -> np.ndarray:
         """
@@ -424,14 +439,14 @@ class AssetSelectorEnv(gym.Env):
         """
         fwd_end = min(idx + self.forward, len(self.prices))
         fwd_ret = self.log_returns.iloc[idx:fwd_end]
-        return np.array(
-            [
-                float(fwd_ret[t].dropna().std() * np.sqrt(TRADING_DAYS))
-                if len(fwd_ret[t].dropna()) >= 5 else np.nan
-                for t in self.tickers
-            ],
-            dtype=np.float32,
-        )
+        results = []
+        for t in self.tickers:
+            ret = fwd_ret[t].dropna()
+            results.append(
+                float(ret.std() * np.sqrt(TRADING_DAYS))
+                if len(ret) >= 5 else np.nan
+            )
+        return np.array(results, dtype=np.float32)
 
     def _compute_forward_ret(self, idx: int) -> np.ndarray:
         """
@@ -440,14 +455,14 @@ class AssetSelectorEnv(gym.Env):
         """
         fwd_end = min(idx + self.forward, len(self.prices))
         fwd_ret = self.log_returns.iloc[idx:fwd_end]
-        return np.array(
-            [
-                float(fwd_ret[t].dropna().mean() * TRADING_DAYS)
-                if len(fwd_ret[t].dropna()) >= 5 else np.nan
-                for t in self.tickers
-            ],
-            dtype=np.float32,
-        )
+        results = []
+        for t in self.tickers:
+            ret = fwd_ret[t].dropna()
+            results.append(
+                float(ret.mean() * TRADING_DAYS)
+                if len(ret) >= 5 else np.nan
+            )
+        return np.array(results, dtype=np.float32)
 
     def _compute_forward_max_dd(self, idx: int) -> np.ndarray:
         """
@@ -470,7 +485,6 @@ class AssetSelectorEnv(gym.Env):
     def compute_sharpe(self, idx: int, forward: int) -> np.ndarray:
         """
         Annualised Sharpe ratio over [idx, idx+forward).
-        Sharpe = (mean_log_return × 252) / (std × √252), zero risk-free rate.
         Returns (n_tickers,) float64, NaN where < 5 valid returns.
         """
         fwd_end = min(idx + forward, len(self.prices))
@@ -491,19 +505,13 @@ class AssetSelectorEnv(gym.Env):
         Composite Spearman reward.
 
         Target rank = 0.7 × rank(fwd_vol) + 0.3 × rank(fwd_max_dd),
-        computed over the intersection of tickers where BOTH fwd_vol AND
-        fwd_max_dd are finite.  Using the intersection (rather than separate
-        masks per component) means the reward is always measured on the same
-        population, so the composite rank is coherent and the gradient signal
-        is consistent across episodes.
-
-        Returns 0.0 if fewer than 3 tickers satisfy the intersection mask.
+        computed over the intersection of tickers where BOTH forward
+        labels are finite. Returns 0.0 if fewer than 3 valid tickers.
         """
         fwd_vol  = self._compute_forward_vol(idx)
         fwd_dd   = self._compute_forward_max_dd(idx)
         has_data = self._get_valid_mask(idx)
 
-        # Intersection: ticker must have valid features AND both forward labels
         valid = (
             has_data
             & np.isfinite(risk_scores)
@@ -513,9 +521,8 @@ class AssetSelectorEnv(gym.Env):
         if valid.sum() < 3:
             return 0.0
 
-        # Percentile ranks within this window (ties broken by average)
-        vol_rank = pd.Series(fwd_vol[valid]).rank(pct=True).values.astype(np.float64)
-        dd_rank  = pd.Series(fwd_dd[valid]).rank(pct=True).values.astype(np.float64)
+        vol_rank       = pd.Series(fwd_vol[valid]).rank(pct=True).values.astype(np.float64)
+        dd_rank        = pd.Series(fwd_dd[valid]).rank(pct=True).values.astype(np.float64)
         composite_rank = 0.7 * vol_rank + 0.3 * dd_rank
 
         rho, _ = spearmanr(risk_scores[valid], composite_rank)
@@ -528,7 +535,6 @@ class AssetSelectorEnv(gym.Env):
         start_idx: Optional[int] = None,
         end_idx:   Optional[int] = None,
     ) -> Iterator[Tuple[pd.Timestamp, np.ndarray, int, np.ndarray]]:
-        
         idx_s = start_idx if start_idx is not None else self._start_idx
         idx_e = end_idx   if end_idx   is not None else self._end_idx
         idx   = idx_s
@@ -550,15 +556,10 @@ class AssetSelectorEnv(gym.Env):
     ) -> List[Dict]:
         """
         Group step indices into non-overlapping 63-day quarters.
-
-        Quarters are defined relative to start_idx so that the training
-        and test periods each produce a self-contained quarter sequence
-        with no gaps or overlaps between them.
-
         """
         idx_s        = start_idx if start_idx is not None else self._start_idx
         idx_e        = end_idx   if end_idx   is not None else self._end_idx
-        quarter_size = self.forward   # 63 trading days = 1 quarter
+        quarter_size = self.forward
 
         all_steps = list(range(idx_s, idx_e, self.step_size))
         if not all_steps:
@@ -567,8 +568,8 @@ class AssetSelectorEnv(gym.Env):
         quarters: List[Dict] = []
         q_num = 0
         while True:
-            q_start_idx = idx_s + q_num * quarter_size
-            q_end_idx   = q_start_idx + quarter_size
+            q_start_idx    = idx_s + q_num * quarter_size
+            q_end_idx      = q_start_idx + quarter_size
             if q_start_idx >= idx_e:
                 break
             window_indices = [i for i in all_steps if q_start_idx <= i < q_end_idx]
@@ -584,7 +585,7 @@ class AssetSelectorEnv(gym.Env):
 
         return quarters
 
-    # Cluster assignment 
+    #  Cluster assignment 
 
     def assign_clusters(
         self,
@@ -597,7 +598,6 @@ class AssetSelectorEnv(gym.Env):
             cluster 0 → 'conservative'
             cluster 1 → 'balanced'
             cluster 2 → 'aggressive'
-
         """
         cluster_ids   = np.full(self.n_tickers, -1, dtype=int)
         risk_profiles = np.full(self.n_tickers, "",  dtype=object)
@@ -615,23 +615,21 @@ class AssetSelectorEnv(gym.Env):
         if thresholds is not None:
             t_low, t_high = thresholds
         else:
-            # Fallback only — callers should always supply thresholds
             logger.warning(
-                "assign_clusters called without thresholds "
+                "assign_clusters called without thresholds — "
                 "falling back to tertile split of current scores. "
                 "This should only happen during testing or debugging."
             )
-            t_low, t_high = float(np.percentile(scores, 33.3)), \
-                            float(np.percentile(scores, 66.7))
+            t_low  = float(np.percentile(scores, 33.3))
+            t_high = float(np.percentile(scores, 66.7))
 
         ids = np.where(
             scores >= t_high, 2,
             np.where(scores >= t_low, 1, 0),
         )
 
-        # Log the resulting distribution so imbalances are visible
         counts = np.bincount(ids, minlength=3)
-        logger.debug(
+        logger.info(
             "assign_clusters: conservative=%d  balanced=%d  aggressive=%d  "
             "(thresholds: %.4f / %.4f)",
             counts[0], counts[1], counts[2], t_low, t_high,

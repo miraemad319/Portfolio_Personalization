@@ -1,38 +1,3 @@
-"""
-visualizer.py
-
-Plots generated
-
-1. cluster_assignments.png
-       Horizontal bar chart — one bar per ticker ranked by mean forward
-       volatility, coloured by current risk profile.  The primary "what
-       did the model decide" plot.
-
-2. actual_risk_return.png
-       Scatter: actual mean forward volatility (x) vs actual mean forward
-       return (y), coloured by current risk profile.  Shows whether the
-       three tiers are genuinely separated in risk-return space.
-
-3. rl_accuracy_scatter.png
-       Scatter: RL risk score (x) vs actual forward volatility (y) for
-       every (window, ticker) pair across the full dataset.  The best-fit
-       line and Spearman ρ show how well the model's continuous score
-       tracks real risk.  Train and test points are plotted in different
-       shades to make the held-out period visible.
-
-4. classification_accuracy.png
-       Bar chart — per-quarter Spearman ρ between label rank and actual
-       forward volatility.  Green = positive (correct ordering), red =
-       negative (inverted).  Train quarters and test quarters are
-       visually distinguished.  This is the primary model evaluation plot.
-
-5. quarterly_sharpe.png
-       Grouped bar chart — mean actual Sharpe per risk profile per quarter.
-       Shows whether conservative / balanced / aggressive buckets had
-       meaningfully different risk-adjusted returns in reality.
-       Train and test quarters are separated by a vertical divider.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -110,7 +75,7 @@ def plot_cluster_assignments(
     ax.set_xlabel("Mean Forward 63-Day Annualised Volatility", fontsize=12)
     ax.set_title(
         "EGX30 Risk Classification — Current Labels\n"
-        "(volatility = mean across all scored quarters)",
+        "(volatility = most recent scored quarter)",
         fontsize=13, fontweight="bold",
     )
     ax.xaxis.set_major_formatter(
@@ -165,7 +130,7 @@ def plot_actual_risk_return(
     ax.set_ylabel("Mean Forward 63-Day Annualised Return",     fontsize=12)
     ax.set_title(
         "Actual Risk-Return by Risk Profile\n"
-        "(values averaged across all scored quarters)",
+        "(values from most recent scored quarter per ticker)",
         fontsize=13, fontweight="bold",
     )
     ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0%}"))
@@ -176,19 +141,7 @@ def plot_actual_risk_return(
     _save(fig, output_path)
     return fig
 
-# Plot 3 — RL score vs actual forward volatility scatter
 
-def plot_rl_accuracy_scatter(
-    scores_df:   pd.DataFrame,
-    fwd_vol_df:  pd.DataFrame,
-    result_df:   pd.DataFrame,
-    output_path: Optional[str] = None,
-) -> plt.Figure:
-    ticker_profile = (
-        result_df.dropna(subset=["risk_profile"])
-        .set_index("ticker")["risk_profile"]
-        .to_dict()
-    )
 
     # Identify the train/test boundary from the index
     all_dates  = scores_df.index.sort_values()
@@ -516,28 +469,6 @@ def plot_all(
         result_df,
         output_path=_path(output_dir, "actual_risk_return.png"),
     )
-
-    if output_dir:
-        scores_path  = Path(output_dir) / "rl_dynamic_scores.csv"
-        fwd_vol_path = Path(output_dir) / "rl_dynamic_fwd_vol.csv"
-
-        if scores_path.exists() and fwd_vol_path.exists():
-            scores_df  = pd.read_csv(
-                scores_path,  index_col=0, parse_dates=True
-            )
-            fwd_vol_df = pd.read_csv(
-                fwd_vol_path, index_col=0, parse_dates=True
-            )
-            
-            plot_rl_accuracy_scatter(
-                scores_df, fwd_vol_df, result_df,
-                output_path=_path(output_dir, "rl_accuracy_scatter.png"),
-            )
-        else:
-            logger.warning(
-                "rl_dynamic_scores.csv or rl_dynamic_fwd_vol.csv not found "
-                "— skipping rl_accuracy_scatter.png"
-            )
 
     if eval_df is not None and not eval_df.empty:
         plot_classification_accuracy(

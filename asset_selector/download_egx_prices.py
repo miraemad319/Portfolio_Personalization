@@ -67,7 +67,7 @@ PROJECT_ROOT = SCRIPT_DIR.parent                      # Portfolio_Personalizatio
 CONFIG_PATH  = SCRIPT_DIR / "assets_egx30.json"
 OUTPUT_DIR   = PROJECT_ROOT / "data" / "raw" / "prices"
 
-N_BARS = 1500  # ~5 years of trading days
+N_BARS = 2100  # ~8 years of trading days
 
 
 # ---------------------------------------------------------------------------

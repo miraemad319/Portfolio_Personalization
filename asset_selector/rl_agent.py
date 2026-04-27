@@ -609,7 +609,7 @@ class RLAssetSelectorAgent:
         logger.info("Agent saved to %s", path)
 
     def load(self, path: str | Path) -> None:
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device,weights_only=True)
         self.actor.load_state_dict(ckpt["actor"])
         self.critic.load_state_dict(ckpt["critic"])
         self.optimizer.load_state_dict(ckpt["optimizer"])

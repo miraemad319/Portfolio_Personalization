@@ -5,12 +5,10 @@ Classifies EGX30 tickers into three risk tiers — conservative, balanced,
 aggressive — using a PPO agent trained on rolling OHLCV feature windows.
 
 Design:
-The RL agent observes 11 features computed from the past 126 trading days
-for every stock and outputs a continuous risk score per stock.  The reward
+The RL agent observes 20 features computed from the past 126 trading days
+for every stock and outputs a continuous risk score per stock. The reward
 signal is the Spearman rank correlation between the agent's scores and the
-actual forward 63-day realised volatility + max drawdown.  The agent learns
-to rank stocks by future risk without ever seeing future data in its features.
-
+actual forward 63-day realised volatility + max drawdown. 
 Output files
 
 quarterly_classifications.csv  — one row per (quarter × ticker)
@@ -26,92 +24,83 @@ rl_dynamic_scores.csv          — per-window RL scores (full history)
 rl_dynamic_fwd_vol.csv         — per-window forward vol (full history)
 rl_training_history.csv        — per-episode training stats
 rl_agent.pt                    — trained model weights
-
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
+from scipy.stats import gaussian_kde, spearmanr
 
 from asset_selector.rl_environment import AssetSelectorEnv
 from asset_selector.rl_agent import RLAssetSelectorAgent
 
 logger = logging.getLogger(__name__)
 
-# Public API
+
+#  Public API 
 
 def classify_assets(
-    prices:     pd.DataFrame,
-    volume:     Optional[pd.DataFrame] = None,
-    n_clusters: int            = 3,
-    n_episodes: int            = 300,    # FIX 7: was 150. With gamma=0 and minibatch
-                               # shuffling, each episode is cheaper to credit-assign
-                               # correctly, so more episodes are affordable and useful.
-    lookback:   int            = 126,
-    forward:    int            = 63,
-    step_size:  int            = 21,
-    train_end:  Optional[str]  = "2024-12-31",
-    output_dir: Optional[str]  = None,
+    ohlcv:      pd.DataFrame,
+    n_clusters: int           = 3,
+    n_episodes: int           = 250,
+    lookback:   int           = 126,
+    forward:    int           = 63,
+    step_size:  int           = 21,
+    train_end:  Optional[str] = "2023-12-31",
+    output_dir: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+   
     if n_clusters != 3:
         raise ValueError("classify_assets currently supports n_clusters=3 only.")
 
-    all_tickers = prices.columns.tolist()
+    all_tickers = ohlcv.columns.get_level_values("ticker").unique().tolist()
     if not all_tickers:
-        raise ValueError("prices DataFrame has no columns.")
+        raise ValueError("ohlcv DataFrame has no tickers.")
 
-    # filter tickers with sufficient data 
-    # A ticker needs at least lookback + forward + 1 valid rows to contribute
-    min_rows        = lookback + forward + 1
-    prices_clean    = prices.replace(0.0, np.nan)
-    data_tickers    = [
+    # Filter tickers with sufficient close-price data
+    min_rows    = lookback + forward + 1
+    close_df    = ohlcv.xs("close", axis=1, level="price_type").replace(0.0, np.nan)
+    data_tickers = [
         t for t in all_tickers
-        if prices_clean[t].notna().sum() >= min_rows
+        if close_df[t].notna().sum() >= min_rows
     ]
     no_data_tickers = [t for t in all_tickers if t not in data_tickers]
 
     if no_data_tickers:
         logger.warning(
-            "%d tickers excluded (insufficient price data, need >= %d rows): %s",
+            "%d tickers excluded (insufficient data, need >= %d rows): %s",
             len(no_data_tickers), min_rows, no_data_tickers,
         )
     if not data_tickers:
-        raise ValueError("No tickers have sufficient price data for RL training.")
+        raise ValueError("No tickers have sufficient data for RL training.")
 
-    # Sort alphabetically so ticker order is deterministic across runs
-    prices_aligned = prices[sorted(data_tickers)]
-    # Align volume to the same ticker set and index
-    if volume is not None:
-        volume_aligned = volume.reindex(
-            columns=sorted(data_tickers), index=prices_aligned.index
-        ).fillna(0.0)
-    else:
-        volume_aligned = pd.DataFrame(
-            0.0, index=prices_aligned.index, columns=sorted(data_tickers)
-        )
+    # Reindex ohlcv to sorted data_tickers — deterministic across runs
+    sorted_tickers = sorted(data_tickers)
+    ohlcv_aligned  = ohlcv.loc[:, (sorted_tickers, slice(None))]
 
     logger.info(
         "classify_assets: %d tickers  %d rows  "
         "lookback=%d  forward=%d  step=%d  episodes=%d  train_end=%s",
-        len(data_tickers), len(prices_aligned),
+        len(sorted_tickers), len(ohlcv_aligned),
         lookback, forward, step_size, n_episodes, train_end,
     )
 
+    # Temporal split
     train_end_idx: Optional[int] = None
     if train_end is not None:
         split_ts  = pd.Timestamp(train_end)
-        split_pos = prices_aligned.index.searchsorted(split_ts, side="right") - 1
-        if 0 <= split_pos < len(prices_aligned):
+        split_pos = ohlcv_aligned.index.searchsorted(split_ts, side="right") - 1
+        if 0 <= split_pos < len(ohlcv_aligned):
             train_end_idx = int(split_pos)
-            train_date    = prices_aligned.index[train_end_idx].strftime("%Y-%m-%d")
-            test_row      = min(train_end_idx + 1, len(prices_aligned) - 1)
-            test_date     = prices_aligned.index[test_row].strftime("%Y-%m-%d")
+            train_date    = ohlcv_aligned.index[train_end_idx].strftime("%Y-%m-%d")
+            test_row      = min(train_end_idx + 1, len(ohlcv_aligned) - 1)
+            test_date     = ohlcv_aligned.index[test_row].strftime("%Y-%m-%d")
             logger.info(
                 "Temporal split — TRAIN through %s (row %d) | "
                 "TEST from %s onward",
@@ -119,15 +108,14 @@ def classify_assets(
             )
         else:
             logger.warning(
-                "train_end '%s' is outside the price data range — "
+                "train_end '%s' is outside the data range — "
                 "split ignored, training on full dataset.",
                 train_end,
             )
 
-    # Build environment 
+    # Build environment
     env = AssetSelectorEnv(
-        prices        = prices_aligned,
-        volume        = volume_aligned,
+        ohlcv         = ohlcv_aligned,
         lookback      = lookback,
         forward       = forward,
         step_size     = step_size,
@@ -135,26 +123,29 @@ def classify_assets(
         train_end_idx = train_end_idx,
     )
 
-    # Build agent 
+    # Build agent
     agent = RLAssetSelectorAgent(
         feature_dim   = env.feature_dim,
         hidden_dims   = [128, 64, 32],
         lr            = 3e-4,
-        gamma         = 0.0,    # FIX 2: independent ranking steps — no discounting
-        gae_lambda    = 0.0,    # FIX 2: consistent with gamma=0
-        entropy_coeff = 0.0,    # FIX 4: replaced by diversity_loss in _ppo_update
+        gamma         = 0.0,
+        gae_lambda    = 0.0,
+        entropy_coeff = 0.0,
         device        = "cpu",
     )
 
-    # Supervised pretraining 
+    # Supervised pretraining
     agent.pretrain(env, n_epochs=150, lr_pretrain=1e-3)
 
-    es_window      = 20    # smooth over last N episodes
-    es_check_every = 10    # evaluate plateau every N episodes
-    es_patience    = 4     # stop after this many consecutive flat checks
-    es_min_delta   = 5e-4  # minimum improvement to count as progress
+    # PPO fine-tuning with early stopping
+    es_window      = 20
+    es_check_every = 10
+    es_patience    = 4
+    es_min_delta   = 5e-4
 
-    logger.info("PPO fine-tuning (max %d episodes, early stopping active) …", n_episodes)
+    logger.info(
+        "PPO fine-tuning (max %d episodes, early stopping active) …", n_episodes
+    )
 
     history:          list  = []
     es_counter:       int   = 0
@@ -199,8 +190,8 @@ def classify_assets(
 
     mean_rew = float(np.mean([h["mean_reward"] for h in history[-10:]]))
     logger.info("Training complete. Mean reward (last 10 episodes): %.4f", mean_rew)
-    
-    # Inference — collect per-window scores 
+
+    # Inference — collect per-window scores
     logger.info("Inference on TRAIN windows …")
     (train_mean_scores,
      train_score_matrix,
@@ -211,7 +202,6 @@ def classify_assets(
         end_idx   = env._end_idx,
     )
 
-    # Test windows 
     if env._test_start_idx is not None and env._test_start_idx < env._full_end_idx:
         logger.info("Inference on TEST windows (held-out) …")
         (test_mean_scores,
@@ -222,13 +212,11 @@ def classify_assets(
             start_idx = env._test_start_idx,
             end_idx   = env._full_end_idx,
         )
-        # Combine for dynamic CSV outputs and static_df
         score_matrix   = np.concatenate([train_score_matrix,   test_score_matrix],   axis=0)
         fwd_vol_matrix = np.concatenate([train_fwd_vol_matrix, test_fwd_vol_matrix], axis=0)
         fwd_ret_matrix = np.concatenate([train_fwd_ret_matrix, test_fwd_ret_matrix], axis=0)
-        # Recompute mean_scores over the full dataset for static_df vol/return cols
-        mean_scores  = np.nanmean(score_matrix, axis=0)
-        valid_counts = np.isfinite(score_matrix).sum(axis=0)
+        mean_scores    = np.nanmean(score_matrix, axis=0)
+        valid_counts   = np.isfinite(score_matrix).sum(axis=0)
         mean_scores[valid_counts < 3] = np.nan
     else:
         score_matrix   = train_score_matrix
@@ -236,10 +224,7 @@ def classify_assets(
         fwd_ret_matrix = train_fwd_ret_matrix
         mean_scores    = train_mean_scores
 
-    
-    
-    # Inference — quarterly classifications
-    # score training windows without thresholds to derive cut points
+    # Threshold derivation — score training windows without thresholds first
     logger.info("Quarterly scoring on TRAIN windows (threshold derivation) …")
     train_quarterly = agent.collect_quarterly_scores(
         env,
@@ -248,7 +233,6 @@ def classify_assets(
         thresholds = None,
     )
 
-    # derive thresholds from the exact scores that will be classified
     train_q_score_matrix = np.stack(
         [q["mean_scores"] for q in train_quarterly], axis=0
     )
@@ -262,16 +246,63 @@ def classify_assets(
         raise ValueError(
             "Too few valid training quarterly scores to compute thresholds."
         )
+
+    # Primary method: percentile-based thresholds on training scores.
+    # These guarantee ~equal thirds of the training ticker population
+    # regardless of score distribution shape.
     t_low  = float(np.percentile(valid_train_q_means, 33.3))
     t_high = float(np.percentile(valid_train_q_means, 66.7))
-    thresholds = (t_low, t_high)
-    logger.info(
-        "Classification thresholds (tertile of per-ticker mean quarterly "
-        "training scores, %d tickers): t_low=%.4f  t_high=%.4f",
-        len(valid_train_q_means), t_low, t_high,
-    )
 
-    # re-run train quarterly inference with the correct thresholds
+    # KDE check: if the distribution has clear natural gaps (bimodal),
+    # prefer the valley boundaries as they reflect genuine risk clusters.
+    # Only use KDE boundaries when both valleys are well-separated from
+    # the percentile boundaries (> 0.5 score units away from t_low/t_high).
+    grid    = np.linspace(valid_train_q_means.min(), valid_train_q_means.max(), 500)
+    kde     = gaussian_kde(valid_train_q_means, bw_method=0.3)
+    density = kde(grid)
+    valleys = [
+        i for i in range(1, len(density) - 1)
+        if density[i] < density[i - 1] and density[i] < density[i + 1]
+    ]
+
+    if len(valleys) >= 2:
+        valleys_by_depth  = sorted(valleys, key=lambda i: density[i])
+        two_deepest       = sorted(valleys_by_depth[:2])
+        kde_t_low  = float(grid[two_deepest[0]])
+        kde_t_high = float(grid[two_deepest[1]])
+        # Only accept KDE boundaries if they differ meaningfully from percentiles
+        # and the resulting balanced tier has at least 10% of tickers
+        n_balanced_kde = int(
+            ((valid_train_q_means >= kde_t_low) &
+             (valid_train_q_means < kde_t_high)).sum()
+        )
+        if n_balanced_kde >= max(3, int(0.10 * len(valid_train_q_means))):
+            t_low, t_high = kde_t_low, kde_t_high
+            logger.info(
+                "Classification thresholds (KDE valley detection, "
+                "%d tickers, %d balanced): t_low=%.4f  t_high=%.4f",
+                len(valid_train_q_means), n_balanced_kde, t_low, t_high,
+            )
+        else:
+            logger.info(
+                "KDE valleys found but balanced tier too thin (%d tickers) — "
+                "using percentile thresholds instead.",
+                n_balanced_kde,
+            )
+            logger.info(
+                "Classification thresholds (percentile, %d tickers): "
+                "t_low=%.4f  t_high=%.4f",
+                len(valid_train_q_means), t_low, t_high,
+            )
+    else:
+        logger.info(
+            "Classification thresholds (percentile, %d tickers): "
+            "t_low=%.4f  t_high=%.4f",
+            len(valid_train_q_means), t_low, t_high,
+        )
+    thresholds = (t_low, t_high)
+
+    # Re-run quarterly inference with correct thresholds
     logger.info("Quarterly inference on TRAIN windows …")
     train_quarterly = agent.collect_quarterly_scores(
         env,
@@ -281,15 +312,13 @@ def classify_assets(
     )
     for q in train_quarterly:
         q["split"] = "train"
-    for q in train_quarterly:
-        q["split"] = "train"
 
     if env._test_start_idx is not None and env._test_start_idx < env._full_end_idx:
         logger.info("Quarterly inference on TEST windows …")
         test_quarterly = agent.collect_quarterly_scores(
             env,
-            start_idx = env._test_start_idx,
-            end_idx   = env._full_end_idx,
+            start_idx  = env._test_start_idx,
+            end_idx    = env._full_end_idx,
             thresholds = thresholds,
         )
         for q in test_quarterly:
@@ -304,7 +333,7 @@ def classify_assets(
         len(train_quarterly), len(test_quarterly), len(quarterly_data),
     )
 
-    # Build quarterly_df 
+    # Build quarterly_df
     quarterly_rows: List[Dict] = []
     for q_data in quarterly_data:
         for i, ticker in enumerate(env.tickers):
@@ -324,25 +353,29 @@ def classify_assets(
         len(quarterly_data), env.n_tickers, len(quarterly_df),
     )
 
-    # Build eval_df 
+    # Build eval_df
     eval_rows:      List[Dict] = []
     spearman_stats: List[Dict] = []
     _label_to_rank = {"conservative": 0, "balanced": 1, "aggressive": 2}
 
+    ticker_to_latest_vol:   Dict[str, float] = {}
+    ticker_to_latest_ret:   Dict[str, float] = {}
+    ticker_to_latest_score: Dict[str, float] = {}
+
     for q_data in quarterly_data:
         q_start       = q_data["quarter_start"]
         q_idx         = q_data["quarter_idx"]
-        risk_profiles = q_data["risk_profiles"]   # np.ndarray of str
+        risk_profiles = q_data["risk_profiles"]
 
         actual_sharpe  = env.compute_sharpe(q_idx, env.forward)
         actual_fwd_vol = env._compute_forward_vol(q_idx)
+        actual_fwd_ret = env._compute_forward_ret(q_idx)
 
         has_profile = np.array([rp != "" for rp in risk_profiles])
         has_vol     = np.isfinite(actual_fwd_vol)
         valid_mask  = has_profile & has_vol
         n_valid     = int(valid_mask.sum())
 
-        # Per-quarter Spearman ρ
         if n_valid >= 3:
             label_ranks = np.array(
                 [
@@ -364,7 +397,6 @@ def classify_assets(
             "split":           q_data.get("split", "train"),
         })
 
-        # classification_correct 
         if n_valid >= 3:
             valid_indices   = np.where(valid_mask)[0]
             vol_for_valid   = actual_fwd_vol[valid_indices]
@@ -397,33 +429,47 @@ def classify_assets(
                 correct = np.nan
 
             eval_rows.append({
-                "quarter_start":         q_start,
-                "ticker":                ticker,
-                "risk_profile":          risk_profiles[i] if risk_profiles[i] != "" else None,
-                "actual_sharpe":         float(actual_sharpe[i])  if np.isfinite(actual_sharpe[i])  else np.nan,
-                "actual_fwd_vol":        float(actual_fwd_vol[i]) if np.isfinite(actual_fwd_vol[i]) else np.nan,
+                "quarter_start":          q_start,
+                "ticker":                 ticker,
+                "risk_profile":           risk_profiles[i] if risk_profiles[i] != "" else None,
+                "actual_sharpe":          float(actual_sharpe[i])  if np.isfinite(actual_sharpe[i])  else np.nan,
+                "actual_fwd_vol":         float(actual_fwd_vol[i]) if np.isfinite(actual_fwd_vol[i]) else np.nan,
                 "classification_correct": correct,
-                "split":                 q_data.get("split", "train"),
+                "split":                  q_data.get("split", "train"),
             })
 
     eval_df = pd.DataFrame(eval_rows)
 
-    # Summary statistics 
+    # Walk quarterly_data in reverse for most-recent-quarter lookups
+    for q_data in reversed(quarterly_data):
+        q_idx          = q_data["quarter_idx"]
+        actual_fwd_vol = env._compute_forward_vol(q_idx)
+        actual_fwd_ret = env._compute_forward_ret(q_idx)
+        for i, ticker in enumerate(env.tickers):
+            rp = q_data["risk_profiles"][i]
+            if rp == "":
+                continue
+            if ticker not in ticker_to_latest_vol and np.isfinite(actual_fwd_vol[i]):
+                ticker_to_latest_vol[ticker] = float(actual_fwd_vol[i])
+                ticker_to_latest_ret[ticker] = (
+                    float(actual_fwd_ret[i]) if np.isfinite(actual_fwd_ret[i]) else np.nan
+                )
+            if ticker not in ticker_to_latest_score and np.isfinite(q_data["mean_scores"][i]):
+                ticker_to_latest_score[ticker] = float(q_data["mean_scores"][i])
+
+    # Summary + static_df
     _log_summary(spearman_stats, eval_df)
 
-    # Build static_df 
-    # risk_profile = label from the most recent quarter that produced a valid label for each ticker.
     static_df = _build_static_df(
-        env            = env,
-        quarterly_data = quarterly_data,
-        mean_scores    = mean_scores,
-        fwd_vol_matrix = fwd_vol_matrix,
-        fwd_ret_matrix = fwd_ret_matrix,
-        no_data_tickers= no_data_tickers,
-        data_tickers   = data_tickers,
+        env                    = env,
+        quarterly_data         = quarterly_data,
+        ticker_to_latest_vol   = ticker_to_latest_vol,
+        ticker_to_latest_ret   = ticker_to_latest_ret,
+        ticker_to_latest_score = ticker_to_latest_score,
+        no_data_tickers        = no_data_tickers,
+        data_tickers           = data_tickers,
     )
 
-    # Save outputs 
     if output_dir:
         _save_outputs(
             out_path       = Path(output_dir),
@@ -441,7 +487,8 @@ def classify_assets(
 
     return quarterly_df, eval_df, static_df
 
-# Internal helpers
+
+#  Internal helpers 
 
 def _log_summary(
     spearman_stats: List[Dict],
@@ -505,10 +552,6 @@ def _log_summary(
                 mean_vol,
             )
 
-    # Top-bottom vol spread — primary evidence of tier separation quality.
-    # A positive spread confirms aggressive tickers are genuinely higher-risk
-    # than conservative ones on the forward window.  Values < 0.05 suggest
-    # the tiers are not meaningfully separated.
     if "aggressive" in profile_mean_vol and "conservative" in profile_mean_vol:
         spread = profile_mean_vol["aggressive"] - profile_mean_vol["conservative"]
         logger.info(
@@ -541,33 +584,36 @@ def _log_summary(
 
 
 def _build_static_df(
-    env:             AssetSelectorEnv,
-    quarterly_data:  List[Dict],
-    mean_scores:     np.ndarray,
-    fwd_vol_matrix:  np.ndarray,
-    fwd_ret_matrix:  np.ndarray,
-    no_data_tickers: List[str],
-    data_tickers:    List[str],
+    env:                    AssetSelectorEnv,
+    quarterly_data:         List[Dict],
+    ticker_to_latest_vol:   Dict[str, float],
+    ticker_to_latest_ret:   Dict[str, float],
+    ticker_to_latest_score: Dict[str, float],
+    no_data_tickers:        List[str],
+    data_tickers:           List[str],
 ) -> pd.DataFrame:
-   
-    # Walk quarterly_data in reverse to find each ticker's most recent label
+
     ticker_to_latest: Dict[str, Tuple[str, pd.Timestamp]] = {}
 
     for q_data in reversed(quarterly_data):
         q_start = q_data["quarter_start"]
         for i, ticker in enumerate(env.tickers):
             if ticker in ticker_to_latest:
-                continue  
+                continue
             rp = q_data["risk_profiles"][i]
             if rp != "":
                 ticker_to_latest[ticker] = (rp, q_start)
 
     _profile_to_id = {"conservative": 0, "balanced": 1, "aggressive": 2}
-    scored_arr = np.array(sorted(data_tickers))   # matches env.tickers order
+    scored_arr = np.array(sorted(data_tickers))
 
-    latest_profiles  = []
+    latest_profiles    = []
     latest_cluster_ids = []
-    latest_quarters  = []
+    latest_quarters    = []
+    latest_scores      = []
+    latest_vols        = []
+    latest_rets        = []
+
     for ticker in env.tickers:
         if ticker in ticker_to_latest:
             rp, qs = ticker_to_latest[ticker]
@@ -579,38 +625,37 @@ def _build_static_df(
             latest_cluster_ids.append(-1)
             latest_quarters.append(pd.NaT)
 
-    latest_profiles_arr   = np.array(latest_profiles,    dtype=object)
-    latest_cluster_arr    = np.array(latest_cluster_ids, dtype=int)
-    latest_quarters_arr   = np.array(latest_quarters,    dtype=object)
+        latest_scores.append(ticker_to_latest_score.get(ticker, np.nan))
+        latest_vols.append(ticker_to_latest_vol.get(ticker, np.nan))
+        latest_rets.append(ticker_to_latest_ret.get(ticker, np.nan))
 
-    vol_values = np.nanmean(fwd_vol_matrix, axis=0)
-    ret_values = np.nanmean(fwd_ret_matrix, axis=0)
+    latest_profiles_arr  = np.array(latest_profiles,    dtype=object)
+    latest_cluster_arr   = np.array(latest_cluster_ids, dtype=int)
+    latest_quarters_arr  = np.array(latest_quarters,    dtype=object)
+    latest_scores_arr    = np.array(latest_scores,      dtype=np.float64)
+    latest_vols_arr      = np.array(latest_vols,        dtype=np.float64)
+    latest_rets_arr      = np.array(latest_rets,        dtype=np.float64)
 
     sort_order = np.argsort(
-        np.where(np.isfinite(vol_values), vol_values, np.inf)
+        np.where(np.isfinite(latest_vols_arr), latest_vols_arr, np.inf)
     )
 
-    tickers_sorted        = scored_arr[sort_order]
-    vol_sorted            = vol_values[sort_order]
-    ret_sorted            = ret_values[sort_order]
-    cluster_ids_sorted    = latest_cluster_arr[sort_order]
-    risk_profiles_sorted  = latest_profiles_arr[sort_order]
-    mean_scores_sorted    = mean_scores[sort_order]
-    quarters_sorted       = latest_quarters_arr[sort_order]
+    static_df = pd.DataFrame({
+        "ticker":              scored_arr[sort_order],
+        "volatility":          latest_vols_arr[sort_order],
+        "mean_return":         latest_rets_arr[sort_order],
+        "cluster_id":          [
+            int(c) if c != -1 else None
+            for c in latest_cluster_arr[sort_order]
+        ],
+        "risk_profile":        [
+            rp if rp != "" else None
+            for rp in latest_profiles_arr[sort_order]
+        ],
+        "rl_risk_score":       latest_scores_arr[sort_order],
+        "most_recent_quarter": latest_quarters_arr[sort_order],
+    })
 
-    static_df = pd.DataFrame({"ticker": tickers_sorted})
-    static_df["volatility"]         = vol_sorted
-    static_df["mean_return"]        = ret_sorted
-    static_df["cluster_id"]         = [
-        int(c) if c != -1 else None for c in cluster_ids_sorted
-    ]
-    static_df["risk_profile"]       = [
-        rp if rp != "" else None for rp in risk_profiles_sorted
-    ]
-    static_df["rl_risk_score"]      = mean_scores_sorted
-    static_df["most_recent_quarter"] = quarters_sorted
-
-    # Append no-data tickers as unclassified rows
     if no_data_tickers:
         nd = pd.DataFrame({"ticker": no_data_tickers})
         nd["volatility"]          = np.nan
@@ -623,7 +668,6 @@ def _build_static_df(
 
     static_df = static_df.reset_index(drop=True)
 
-    # Log the static summary
     logger.info("Current risk profile (most recent quarter) summary:")
     for profile in ("conservative", "balanced", "aggressive"):
         grp = static_df[static_df["risk_profile"] == profile]
@@ -663,10 +707,8 @@ def _save_outputs(
 ) -> None:
     out_path.mkdir(parents=True, exist_ok=True)
 
-    # Model weights
     agent.save(out_path / "rl_agent.pt")
 
-    # Per-window dynamic scores (full dataset: train + test)
     window_dates = [
         env.prices.index[min(i, len(env.prices) - 1)]
         for i in range(env._start_idx, env._full_end_idx, env.step_size)
@@ -687,32 +729,22 @@ def _save_outputs(
     ).to_csv(out_path / "rl_dynamic_fwd_vol.csv")
     logger.info("Dynamic fwd vol saved to %s", out_path / "rl_dynamic_fwd_vol.csv")
 
-    # Training history
     pd.DataFrame(history).to_csv(
         out_path / "rl_training_history.csv", index=False
     )
     logger.info("Training history saved.")
 
-    # Quarterly classifications
-    quarterly_df.to_csv(
-        out_path / "quarterly_classifications.csv", index=False
-    )
-    logger.info(
-        "Quarterly classifications saved (%d rows).", len(quarterly_df)
-    )
+    quarterly_df.to_csv(out_path / "quarterly_classifications.csv", index=False)
+    logger.info("Quarterly classifications saved (%d rows).", len(quarterly_df))
 
-    # Evaluation
     eval_df.to_csv(out_path / "evaluation.csv", index=False)
     logger.info("Evaluation saved (%d rows).", len(eval_df))
 
-    # Per-quarter Spearman
     pd.DataFrame(spearman_stats).to_csv(
         out_path / "quarterly_spearman.csv", index=False
     )
     logger.info("Per-quarter Spearman saved.")
 
-    # risk_profiles.json — CURRENT labels (most recent quarter per ticker)
-    # This is what the downstream portfolio models consume.
     profile_map: Dict[str, List[str]] = {
         "conservative": [],
         "balanced":     [],
@@ -723,11 +755,8 @@ def _save_outputs(
     for k in profile_map:
         profile_map[k] = sorted(profile_map[k])
 
-  
     latest_quarter_dates = (
-        static_df["most_recent_quarter"]
-        .dropna()
-        .sort_values()
+        static_df["most_recent_quarter"].dropna().sort_values()
     )
     profile_map["as_of_quarter"] = (
         str(latest_quarter_dates.iloc[-1].date())
@@ -735,7 +764,6 @@ def _save_outputs(
         else "unknown"
     )
 
-    import json
     (out_path / "risk_profiles.json").write_text(
         json.dumps(profile_map, indent=2), encoding="utf-8"
     )
@@ -744,26 +772,25 @@ def _save_outputs(
         profile_map["as_of_quarter"],
     )
 
-    # asset_classification.csv 
     static_df.to_csv(out_path / "asset_classification.csv", index=False)
     logger.info("asset_classification.csv saved.")
 
-# Utility
+    logger.info("=" * 60)
+    logger.info("Output files written to %s", out_path)
+    logger.info("  risk_profiles.json             ← downstream portfolio models")
+    logger.info("  quarterly_classifications.csv  ← full dynamic history")
+    logger.info("  evaluation.csv                 ← Sharpe / accuracy per quarter")
+    logger.info("  quarterly_spearman.csv         ← per-quarter Spearman ρ")
+    logger.info("  asset_classification.csv       ← current labels (visualiser)")
+
+
+#  Utility 
 
 def get_profile_tickers(
     classification: pd.DataFrame,
     profile:        str,
 ) -> List[str]:
-    """
-    Return sorted list of tickers with the given risk profile.
-
-    Parameters
-    ----------
-    classification : pd.DataFrame
-        Output static_df from classify_assets().
-    profile : str
-        One of 'conservative', 'balanced', 'aggressive'.
-    """
+    """Return sorted list of tickers with the given risk profile."""
     valid = {"conservative", "balanced", "aggressive"}
     if profile not in valid:
         raise ValueError(f"profile must be one of {valid}, got '{profile}'")

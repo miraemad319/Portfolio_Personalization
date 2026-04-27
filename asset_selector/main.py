@@ -1,29 +1,22 @@
-"""
-main.py
-
-Entry point for the EGX30 Asset Selector pipeline.
-
-Pipeline stages
----------------
-1. Universe + config   (assets_egx30.json)
-2. Price loading       (data/raw/prices/*.csv — produced by download_egx_prices.py)
-3. RL classification   (asset_selector.py)
-4. Visualisation       (visualizer.py)
-5. Output              (CSV + JSON)
-
-"""
-
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+import random
 import sys
 from datetime import date
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
+import torch
+
+random.seed(2)
+np.random.seed(2)
+torch.manual_seed(2)
+torch.use_deterministic_algorithms(True, warn_only=True)
 
 _HERE = Path(__file__).resolve().parent          # asset_selector/
 sys.path.insert(0, str(_HERE.parent))            # Portfolio_Personalization/
@@ -36,7 +29,19 @@ _PRICES_DIR  = _HERE.parent / "data" / "raw" / "prices"
 
 logger = logging.getLogger(__name__)
 
-# Config + price loading
+# Column name mapping 
+
+_OHLCV_COLS = ["open", "high", "low", "close", "volume"]
+
+def _find_col(columns: list[str], name: str) -> Optional[str]:
+    """Case-insensitive column lookup. Returns None if not found."""
+    for c in columns:
+        if c.lower() == name:
+            return c
+    return None
+
+
+# Preprocessing 
 
 def _load_config() -> dict:
     with open(_CONFIG_PATH, encoding="utf-8") as f:
@@ -45,7 +50,8 @@ def _load_config() -> dict:
 
 def _apply_preprocessing(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Three-rule preprocessing applied to the combined close-price DataFrame.
+    Three-rule preprocessing applied to a single price-type DataFrame
+    (open, high, low, or close — NOT volume).
 
     Rule 3 (applied FIRST):
         For each calendar year strictly after a stock's first valid
@@ -54,59 +60,63 @@ def _apply_preprocessing(df: pd.DataFrame) -> pd.DataFrame:
         Years before first listing are left as NaN.
 
     Rule 2 (applied SECOND):
-        Forward-fill from first_valid_index onward.  The 0.0 blocks
-        produced by Rule 3 are non-NaN, so ffill stops at them correctly.
+        Forward-fill from first_valid_index onward. The 0.0 blocks
+        produced by Rule 3 are non-NaN so ffill stops at them correctly.
 
     Rule 1 (implicit):
         Leading NaN rows before a stock's first listing date are never
         touched — they represent genuine absence from the market.
-
     """
     df = df.copy()
     for col in df.columns:
-        series = df[col]
-        fvi    = series.first_valid_index()
+        series   = df[col]
+        fvi      = series.first_valid_index()
         if fvi is None:
             continue
+        fvi_year = fvi.year
 
-        fvi_year: int = fvi.year
-
-        # Rule 3: mark whole-year NaN gaps after first listing as 0.0
         for yr in sorted(df.index.year.unique()):
             if yr <= fvi_year:
                 continue
             yr_mask = df.index.year == yr
             if df.loc[yr_mask, col].isna().all():
                 df.loc[yr_mask, col] = 0.0
-                logger.debug(
-                    "%s: year %d all-NaN after listing — set to 0.0", col, yr
-                )
+                logger.debug("%s: year %d all-NaN after listing → 0.0", col, yr)
 
-        # Rule 2: forward-fill from first valid observation
         df.loc[fvi:, col] = df.loc[fvi:, col].ffill()
 
     return df
 
 
-def _load_prices(
+# Price loading 
+
+def _load_ohlcv(
     universe:   list[str],
     start:      date,
     end:        date,
     prices_dir: Path,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> pd.DataFrame:
     """
-    Read per-ticker CSVs, apply preprocessing rules, filter to [start, end].
+    Read per-ticker CSVs and return a single MultiIndex DataFrame.
 
-    Returns
-    -------
-    close_df  : pd.DataFrame  DatetimeIndex, columns = tickers, close prices
-    volume_df : pd.DataFrame  DatetimeIndex, columns = tickers, raw volume
-                Volume is NOT preprocessed with the three rules — NaN where
-                missing, 0.0 where the stock was inactive. Forward-fill is
-                not applied to volume because zero volume is meaningful.
+    Structure
+    ---------
+    Columns : MultiIndex (ticker, price_type)
+              price_type ∈ {open, high, low, close, volume}
+    Index   : DatetimeIndex (daily, normalised to midnight)
+
+    Preprocessing
+    -------------
+    open, high, low, close : three-rule preprocessing applied
+                             (delisting markers + forward fill).
+    volume                 : zeros replaced with NaN, no forward fill.
+                             Missing dates filled with 0.0 after alignment.
+
+    All price types are outer-joined on the date index and filtered
+    to [start, end].
     """
-    close_frames:  dict[str, pd.Series] = {}
-    volume_frames: dict[str, pd.Series] = {}
+    # Accumulate per-price-type frames: {price_type: {ticker: Series}}
+    frames: dict[str, dict[str, pd.Series]] = {c: {} for c in _OHLCV_COLS}
 
     for ticker in universe:
         csv_path = prices_dir / f"{ticker}.csv"
@@ -119,71 +129,94 @@ def _load_prices(
             continue
 
         raw = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+        raw.index = pd.to_datetime(raw.index).normalize()
+        raw       = raw[~raw.index.duplicated(keep="first")].sort_index()
+        cols      = raw.columns.tolist()
 
-        close_col = next(
-            (c for c in raw.columns if c.lower() == "close"), None
-        )
-        if close_col is None:
-            close_col = raw.columns[-1]
+        for price_type in _OHLCV_COLS:
+            src_col = _find_col(cols, price_type)
+            if src_col is None:
+                logger.debug("%s: column '%s' not found — will be NaN", ticker, price_type)
+                continue
+            s = raw[src_col].copy()
+            if not s.empty:
+                frames[price_type][ticker] = s
 
-        vol_col = next(
-            (c for c in raw.columns if c.lower() == "volume"), None
-        )
-
-        s_close = raw[close_col].sort_index()
-        s_close.index = pd.to_datetime(s_close.index).normalize()
-        if not s_close.empty:
-            close_frames[ticker] = s_close
-
-        if vol_col is not None:
-            s_vol = raw[vol_col].sort_index()
-            s_vol.index = pd.to_datetime(s_vol.index).normalize()
-            if not s_vol.empty:
-                volume_frames[ticker] = s_vol
-
-    if not close_frames:
+    if not frames["close"]:
         raise FileNotFoundError(
-            f"No price CSVs found in {prices_dir}. "
+            f"No close-price CSVs found in {prices_dir}. "
             "Run asset_selector/download_egx_prices.py first."
         )
 
-    # Close prices — outer join, apply preprocessing rules
-    close_df = pd.DataFrame(close_frames).sort_index()
+    # Build a reference date index from the close prices
+    close_df = pd.DataFrame(frames["close"]).sort_index()
     close_df = close_df.loc[~close_df.index.duplicated(keep="first")]
     close_df = _apply_preprocessing(close_df)
     close_df = close_df.loc[str(start) : str(end)]
+    date_index = close_df.index          # canonical index all others align to
+    tickers    = sorted(close_df.columns.tolist())
 
-    # Volume — outer join, no preprocessing rules applied
-    # Replace NaN with 0 so downstream code can safely check vol > 0
-    if volume_frames:
-        volume_df = pd.DataFrame(volume_frames).sort_index()
-        volume_df = volume_df.loc[~volume_df.index.duplicated(keep="first")]
-        volume_df = volume_df.loc[str(start) : str(end)]
-        # Align to close index
-        volume_df = volume_df.reindex(close_df.index).fillna(0.0)
-    else:
-        logger.warning("No volume data found — volume features will be NaN.")
-        volume_df = pd.DataFrame(
-            0.0, index=close_df.index, columns=close_df.columns
+    # Process each price type
+    processed: dict[str, pd.DataFrame] = {}
+
+    for price_type in _OHLCV_COLS:
+        if not frames[price_type]:
+            logger.warning(
+                "No data for price type '%s' — filling with NaN.", price_type
+            )
+            processed[price_type] = pd.DataFrame(
+                np.nan, index=date_index, columns=tickers
+            )
+            continue
+
+        df = pd.DataFrame(frames[price_type]).sort_index()
+        df = df.loc[~df.index.duplicated(keep="first")]
+
+        if price_type == "volume":
+            # Volume: no three-rule preprocessing, zeros → NaN, missing → 0
+            df = df.reindex(index=date_index, columns=tickers)
+            df = df.replace(0.0, np.nan)
+            # Leave NaN — env handles it; downstream fillna(0) if needed
+        else:
+            # open / high / low: same three-rule preprocessing as close
+            df = _apply_preprocessing(df)
+            df = df.loc[str(start) : str(end)]
+            df = df.reindex(index=date_index, columns=tickers)
+
+        processed[price_type] = df
+
+    # Assemble MultiIndex DataFrame: columns = (ticker, price_type)
+    ticker_dfs = {}
+    for ticker in tickers:
+        ticker_dfs[ticker] = pd.DataFrame(
+            {pt: processed[pt][ticker] for pt in _OHLCV_COLS},
+            index=date_index,
         )
 
-    logger.info(
-        "Prices loaded: %d tickers  %d rows  (%s → %s)",
-        close_df.shape[1], close_df.shape[0],
-        close_df.index[0].date(), close_df.index[-1].date(),
-    )
-    return close_df, volume_df
+    ohlcv = pd.concat(ticker_dfs, axis=1)   # columns: (ticker, price_type)
+    ohlcv.columns.names = ["ticker", "price_type"]
 
-# Pipeline
+    logger.info(
+        "OHLCV loaded: %d tickers  %d rows  (%s → %s)",
+        len(tickers), len(date_index),
+        date_index[0].date(), date_index[-1].date(),
+    )
+    return ohlcv
+
+
+# Pipeline 
 
 def run_pipeline(
     output_dir:     str            = "asset_selector/output",
     generate_plots: bool           = True,
     n_episodes:     int            = 250,
-    start:          date           = date(2020, 1, 1),
-    end:            date           = date(2026, 4, 22),
-    train_end:      Optional[str]  = "2024-12-31",
+    start:          date           = date(2018, 1, 1),
+    end:            Optional[date] = None,
+    train_end:      Optional[str]  = "2023-12-31",
     prices_dir:     Optional[str]  = None,
+    lookback:       int            = 126,
+    forward:        int            = 63,
+    step_size:      int            = 21,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Execute the full EGX30 Asset Selector pipeline.
@@ -201,50 +234,44 @@ def run_pipeline(
     out.mkdir(parents=True, exist_ok=True)
     pdir = Path(prices_dir) if prices_dir else _PRICES_DIR
 
-    # Stage 1: Universe 
+    if end is None:
+        end = date.today()
+
+    # Stage 1: Universe
     logger.info("=" * 60)
     logger.info("Stage 1 / 4 — Loading universe from config")
     logger.info("=" * 60)
     config   = _load_config()
     universe = config["historical_tickers"]
-    logger.info("Universe: %d tickers", len(universe))
+    cfg_start = config.get("start_date")
+    if cfg_start and start == date(2018, 1, 1):
+        start = date.fromisoformat(cfg_start)
+    logger.info("Universe: %d tickers  start=%s", len(universe), start)
 
-    # Stage 2: Price data
+    # Stage 2: OHLCV data
     logger.info("=" * 60)
-    logger.info("Stage 2 / 4 — Loading prices from %s", pdir)
+    logger.info("Stage 2 / 4 — Loading OHLCV from %s", pdir)
     logger.info("=" * 60)
-    prices, volume = _load_prices(universe, start=start, end=end, prices_dir=pdir)
+    ohlcv = _load_ohlcv(universe, start=start, end=end, prices_dir=pdir)
 
-    # Cache both so run_rl.py can skip this stage
-    prices_path = out / "prices.parquet"
-    volume_path = out / "volume.parquet"
-    prices.to_parquet(prices_path)
-    volume.to_parquet(volume_path)
-    logger.info("Prices cached to %s  Volume cached to %s", 
-                prices_path, volume_path,
-    )
+    # Cache so run_rl.py can skip this stage
+    ohlcv_path = out / "ohlcv.parquet"
+    ohlcv.to_parquet(ohlcv_path)
+    logger.info("OHLCV cached to %s", ohlcv_path)
 
-
-    # Stage 3: RL risk profiling 
+    # Stage 3: RL risk profiling
     logger.info("=" * 60)
     logger.info("Stage 3 / 4 — RL risk profiling")
     logger.info("=" * 60)
     quarterly_df, eval_df, static_df = classify_assets(
-        prices,
-        volume     = volume,
+        ohlcv,
         n_episodes = n_episodes,
         train_end  = train_end,
         output_dir = output_dir,
+        lookback   = lookback,
+        forward    = forward,
+        step_size  = step_size,
     )
-
-    # Log file locations for the downstream team
-    logger.info("=" * 60)
-    logger.info("Output files written to %s", out)
-    logger.info("  risk_profiles.json             ← downstream portfolio models")
-    logger.info("  quarterly_classifications.csv  ← full dynamic history")
-    logger.info("  evaluation.csv                 ← Sharpe / accuracy per quarter")
-    logger.info("  quarterly_spearman.csv         ← per-quarter Spearman ρ")
-    logger.info("  asset_classification.csv       ← current labels (visualiser)")
 
     # Stage 4: Visualisation
     if generate_plots:
@@ -253,7 +280,7 @@ def run_pipeline(
         logger.info("=" * 60)
         plot_all(static_df, output_dir=output_dir, eval_df=eval_df)
 
-    #  Final summary 
+    # Final summary
     logger.info("=" * 60)
     logger.info("Pipeline complete — %d tickers classified", len(static_df))
     logger.info("=" * 60)
@@ -263,20 +290,15 @@ def run_pipeline(
 
     return quarterly_df, eval_df, static_df
 
-# CLI
+
+# CLI 
+
 def _cli() -> None:
-    import random
-    import numpy as np
-    import torch
-    random.seed(1)
-    np.random.seed(1)
-    torch.manual_seed(1)
-    torch.use_deterministic_algorithms(True)
     logging.basicConfig(
-        level   = logging.INFO,
-        format  = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-        datefmt = "%H:%M:%S",
-        handlers= [logging.StreamHandler(sys.stdout)],
+        level    = logging.INFO,
+        format   = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+        datefmt  = "%H:%M:%S",
+        handlers = [logging.StreamHandler(sys.stdout)],
     )
 
     parser = argparse.ArgumentParser(
@@ -308,7 +330,7 @@ def _cli() -> None:
     )
     parser.add_argument(
         "--train-end",
-        default = "2024-12-31",
+        default = "2023-12-31",
         metavar = "DATE",
         help    = (
             "Last day of the training period in ISO format "

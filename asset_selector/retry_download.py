@@ -8,7 +8,7 @@ sys.path.insert(0, str(_HERE))
 from src.ingestion.egxlytics_client import EGXDataClient
 import time
 
-failed_tickers = ["MNHD", "PIOH", "GBAU", "PORT"]  # old rebrand tickers needed for merge history
+failed_tickers = ["MNHD","EKHO", "EKHOA","FAITA","ISPH", "JUFO", "MCQE", "OFH", "PIOH", "GBAU", "PORT"]  # old rebrand tickers needed for merge history
 
 output_dir = _HERE.parent / "data" / "raw" / "prices"
 client = EGXDataClient()
@@ -23,7 +23,7 @@ for i, ticker in enumerate(failed_tickers, 1):
         print(f"  ... Waiting 10s...")  # Longer delay
         time.sleep(20)
     
-    df = client.fetch_stock_prices(ticker, n_bars=1500)
+    df = client.fetch_stock_prices(ticker, n_bars=2100)
     
     if df is not None and not df.empty:
         output_file = output_dir / f"{ticker}.csv"
