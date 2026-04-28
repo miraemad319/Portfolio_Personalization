@@ -43,7 +43,7 @@ def run_rl_only(
     train_end:      Optional[str] = "2023-12-31",
     generate_plots: bool          = True,
     lookback:       int           = 126,
-    forward:        int           = 63,
+    forward:        int           = 126,
     step_size:      int           = 21,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     out = Path(output_dir)
@@ -73,7 +73,7 @@ def run_rl_only(
         "Running RL classification: %d episodes  train_end=%s",
         n_episodes, train_end,
     )
-    quarterly_df, eval_df, static_df = classify_assets(
+    semi_annual_df, eval_df, static_df = classify_assets(
         ohlcv,
         n_episodes = n_episodes,
         train_end  = train_end,
@@ -96,7 +96,7 @@ def run_rl_only(
         tickers = get_profile_tickers(static_df, profile)
         logger.info("  %-12s (%2d): %s", profile, len(tickers), tickers)
 
-    return quarterly_df, eval_df, static_df
+    return semi_annual_df, eval_df, static_df
 
 
 # CLI 
@@ -124,9 +124,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--forward",
         type    = int,
-        default = 63,
+        default = 126,
         metavar = "N",
-        help    = "Forward window in trading days (default: 63)",
+        help    = "Forward window in trading days (default: 126)",
     )
     parser.add_argument(
         "--step-size",

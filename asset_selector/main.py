@@ -215,21 +215,9 @@ def run_pipeline(
     train_end:      Optional[str]  = "2023-12-31",
     prices_dir:     Optional[str]  = None,
     lookback:       int            = 126,
-    forward:        int            = 63,
+    forward:        int            = 126,
     step_size:      int            = 21,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Execute the full EGX30 Asset Selector pipeline.
-
-    Returns
-    -------
-    quarterly_df : pd.DataFrame
-        Dynamic quarterly classifications (train + test, split-labelled).
-    eval_df : pd.DataFrame
-        Evaluation results with actual Sharpe, fwd vol, and accuracy flags.
-    static_df : pd.DataFrame
-        One row per ticker — risk_profile is the most recent quarterly label.
-    """
     out  = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     pdir = Path(prices_dir) if prices_dir else _PRICES_DIR
@@ -263,7 +251,7 @@ def run_pipeline(
     logger.info("=" * 60)
     logger.info("Stage 3 / 4 — RL risk profiling")
     logger.info("=" * 60)
-    quarterly_df, eval_df, static_df = classify_assets(
+    semi_annual_df, eval_df, static_df = classify_assets(
         ohlcv,
         n_episodes = n_episodes,
         train_end  = train_end,
@@ -288,7 +276,7 @@ def run_pipeline(
         tickers = get_profile_tickers(static_df, profile)
         logger.info("  %-12s (%2d): %s", profile, len(tickers), tickers)
 
-    return quarterly_df, eval_df, static_df
+    return semi_annual_df, eval_df, static_df
 
 
 # CLI 

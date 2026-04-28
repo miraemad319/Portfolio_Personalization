@@ -23,7 +23,7 @@ RLAssetSelectorAgent
                               restricted strictly to training-period windows.
     train()                 — PPO fine-tuning for N episodes.
     collect_all_scores()    — deterministic inference over a window range.
-    collect_quarterly_scores() — inference grouped into 63-day quarters.
+    collect_period_scores() — inference grouped into semi annual periods.
     save() / load()         — checkpoint both networks.
 
 """
@@ -203,9 +203,7 @@ class RLAssetSelectorAgent:
         clip_eps:      float = 0.2,
         ppo_epochs:    int   = 10,
         value_coeff:   float = 0.5,
-        entropy_coeff: float = 0.0,   # FIX 4: was 0.05. See _ppo_update for
-                                      # explanation — entropy is replaced by
-                                      # the diversity_loss on mean scores.
+        entropy_coeff: float = 0.0,   
         device:        str   = "cpu",
     ) -> None:
         if hidden_dims is None:
@@ -424,8 +422,7 @@ class RLAssetSelectorAgent:
         value_losses: List[float] = []
 
         for epoch_idx in range(self.ppo_epochs):
-            # FIX 5 (minibatch shuffling) is applied inside this loop — see below.
-            # We re-shuffle each epoch so the model never sees the same
+            # shuffle each epoch so the model never sees the same
             # temporal ordering twice within a single PPO update.
             T = obs_batch.shape[0]
             mb_size = min(32, T)
@@ -535,25 +532,14 @@ class RLAssetSelectorAgent:
 
         return mean_scores, score_matrix, fwd_vol_matrix, fwd_ret_matrix
 
-    def collect_quarterly_scores(
+    def collect_period_scores(
         self,
         env,
         start_idx:  Optional[int]                  = None,
         end_idx:    Optional[int]                  = None,
         thresholds: Optional[Tuple[float, float]]  = None,
     ) -> List[Dict]:
-        """
-        Deterministic inference grouped into non-overlapping 63-day quarters.
-
-        Parameters
-        env        : AssetSelectorEnv
-        start_idx  : int | None
-        end_idx    : int | None
-        thresholds : (t_low, t_high) | None
-            Fixed score thresholds derived from training data.
-            Passed through to env.assign_clusters() for every quarter.
-        """
-        quarters = env.collect_quarterly_windows(
+        quarters = env.collect_period_windows(
             start_idx=start_idx, end_idx=end_idx
         )
         result: List[Dict] = []
@@ -581,19 +567,20 @@ class RLAssetSelectorAgent:
             )
 
             result.append({
-                "quarter_start":  q["quarter_start"],
-                "quarter_idx":    q["quarter_idx"],
-                "mean_scores":    mean_scores,
-                "risk_profiles":  risk_profiles,
-                "cluster_ids":    cluster_ids,
+                "semiannual_start": q["quarter_start"],
+                "period_start":     q["quarter_start"],
+                "period_idx":       q["quarter_idx"],
+                "mean_scores":      mean_scores,
+                "risk_profiles":    risk_profiles,
+                "cluster_ids":      cluster_ids,
             })
 
         logger.info(
-            "Quarterly scoring complete: %d quarters "
+            "Semi annual scoring complete: %d periods "
             "(start=%s, end=%s)",
             len(result),
-            result[0]["quarter_start"].strftime("%Y-%m-%d") if result else "N/A",
-            result[-1]["quarter_start"].strftime("%Y-%m-%d") if result else "N/A",
+            result[0]["period_start"].strftime("%Y-%m-%d") if result else "N/A",
+            result[-1]["period_start"].strftime("%Y-%m-%d") if result else "N/A",
         )
         return result
 

@@ -8,24 +8,26 @@ Design:
 The RL agent observes 20 features computed from the past 126 trading days
 for every stock and outputs a continuous risk score per stock. The reward
 signal is the Spearman rank correlation between the agent's scores and the
-actual forward 63-day realised volatility + max drawdown. 
+actual forward 126-day realised volatility + max drawdown. Classifications
+are produced every 126 days (semi-annual), with each period's label based
+on averaging 6 window scores within that period.
+
 Output files
 
-quarterly_classifications.csv  — one row per (quarter × ticker)
-                                  columns: quarter_start | ticker |
-                                  rl_risk_score | risk_profile | split
-evaluation.csv                 — same + actual_sharpe | actual_fwd_vol |
-                                  classification_correct | split
-quarterly_spearman.csv         — per-quarter Spearman ρ with split label
-risk_profiles.json             — CURRENT labels (most recent quarter),
-                                  consumed by downstream portfolio models
-asset_classification.csv       — same current labels, for the visualiser
-rl_dynamic_scores.csv          — per-window RL scores (full history)
-rl_dynamic_fwd_vol.csv         — per-window forward vol (full history)
-rl_training_history.csv        — per-episode training stats
-rl_agent.pt                    — trained model weights
+semi_annual_classifications.csv — one row per (period × ticker)
+                                   columns: period_start | ticker |
+                                   rl_risk_score | risk_profile | split
+evaluation.csv                  — same + actual_sharpe | actual_fwd_vol |
+                                   classification_correct | split
+semi_annual_spearman.csv        — per-period Spearman ρ with split label
+risk_profiles.json              — CURRENT labels (most recent period),
+                                   consumed by downstream portfolio models
+asset_classification.csv        — same current labels, for the visualiser
+rl_dynamic_scores.csv           — per-window RL scores (full history)
+rl_dynamic_fwd_vol.csv          — per-window forward vol (full history)
+rl_training_history.csv         — per-episode training stats
+rl_agent.pt                     — trained model weights
 """
-
 from __future__ import annotations
 
 import json
@@ -42,22 +44,20 @@ from asset_selector.rl_agent import RLAssetSelectorAgent
 
 logger = logging.getLogger(__name__)
 
-
 #  Public API 
-
 def classify_assets(
     ohlcv:      pd.DataFrame,
     n_clusters: int           = 3,
     n_episodes: int           = 250,
     lookback:   int           = 126,
-    forward:    int           = 63,
+    forward:    int           = 126,
     step_size:  int           = 21,
     train_end:  Optional[str] = "2023-12-31",
     output_dir: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
    
     if n_clusters != 3:
-        raise ValueError("classify_assets currently supports n_clusters=3 only.")
+        raise ValueError("classify_assets supports n_clusters=3 only.")
 
     all_tickers = ohlcv.columns.get_level_values("ticker").unique().tolist()
     if not all_tickers:
@@ -80,7 +80,7 @@ def classify_assets(
     if not data_tickers:
         raise ValueError("No tickers have sufficient data for RL training.")
 
-    # Reindex ohlcv to sorted data_tickers — deterministic across runs
+    # Reindex ohlcv to sorted data_tickers 
     sorted_tickers = sorted(data_tickers)
     ohlcv_aligned  = ohlcv.loc[:, (sorted_tickers, slice(None))]
 
@@ -140,7 +140,7 @@ def classify_assets(
     # PPO fine-tuning with early stopping
     es_window      = 20
     es_check_every = 10
-    es_patience    = 4
+    es_patience    = 2
     es_min_delta   = 5e-4
 
     logger.info(
@@ -225,54 +225,54 @@ def classify_assets(
         mean_scores    = train_mean_scores
 
 
-    # Quarterly inference — per-quarter tertile thresholds, matching
-    # the evaluation which also uses per-quarter tertiles of actual vol.
-    logger.info("Quarterly inference on TRAIN windows …")
-    train_quarterly = agent.collect_quarterly_scores(
+    # Semi annual inference — per-semi annual period tertile thresholds, matching
+    # the evaluation which also uses per-semi annual tertiles of actual vol.
+    logger.info("Semi-annual inference on TRAIN windows …")
+    train_period = agent.collect_period_scores(
         env,
         start_idx  = env._start_idx,
         end_idx    = env._end_idx,
         thresholds = None,
     )
-    for q in train_quarterly:
+    for q in train_period:
         q["split"] = "train"
 
     if env._test_start_idx is not None and env._test_start_idx < env._full_end_idx:
-        logger.info("Quarterly inference on TEST windows …")
-        test_quarterly = agent.collect_quarterly_scores(
+        logger.info("Semi annual inference on TEST windows …")
+        test_period = agent.collect_period_scores(
             env,
             start_idx  = env._test_start_idx,
             end_idx    = env._full_end_idx,
             thresholds = None,
         )
-        for q in test_quarterly:
+        for q in test_period:
             q["split"] = "test"
 
-    quarterly_data = train_quarterly + test_quarterly
+    period_data = train_period + test_period
 
     logger.info(
-        "Total quarters: %d train + %d test = %d",
-        len(train_quarterly), len(test_quarterly), len(quarterly_data),
+        "Total periods: %d train + %d test = %d",
+        len(train_period), len(test_period), len(period_data),
     )
 
-    # Build quarterly_df
-    quarterly_rows: List[Dict] = []
-    for q_data in quarterly_data:
+    # Build semiannual_df
+    period_rows: List[Dict] = []
+    for q_data in period_data:
         for i, ticker in enumerate(env.tickers):
             score = q_data["mean_scores"][i]
             rp    = q_data["risk_profiles"][i]
-            quarterly_rows.append({
-                "quarter_start": q_data["quarter_start"],
+            period_rows.append({
+                "semiannual_start": q_data["semiannual_start"],
                 "ticker":        ticker,
                 "rl_risk_score": float(score) if np.isfinite(score) else np.nan,
                 "risk_profile":  rp if rp != "" else None,
                 "split":         q_data.get("split", "train"),
             })
-    quarterly_df = pd.DataFrame(quarterly_rows)
+    semi_annual_df = pd.DataFrame(period_rows)
 
     logger.info(
-        "quarterly_df: %d quarters × %d tickers = %d rows",
-        len(quarterly_data), env.n_tickers, len(quarterly_df),
+        "semi_annual_df: %d periods × %d tickers = %d rows",
+        len(period_data), env.n_tickers, len(semi_annual_df),
     )
 
     # Build eval_df
@@ -284,9 +284,9 @@ def classify_assets(
     ticker_to_latest_ret:   Dict[str, float] = {}
     ticker_to_latest_score: Dict[str, float] = {}
 
-    for q_data in quarterly_data:
-        q_start       = q_data["quarter_start"]
-        q_idx         = q_data["quarter_idx"]
+    for q_data in period_data:
+        q_start       = q_data["period_start"]
+        q_idx         = q_data["period_idx"]
         risk_profiles = q_data["risk_profiles"]
 
         actual_sharpe  = env.compute_sharpe(q_idx, env.forward)
@@ -313,7 +313,7 @@ def classify_assets(
             rho = np.nan
 
         spearman_stats.append({
-            "quarter_start":   q_start,
+            "period_start":   q_start,
             "spearman_rho":    rho,
             "n_valid_tickers": n_valid,
             "split":           q_data.get("split", "train"),
@@ -351,7 +351,7 @@ def classify_assets(
                 correct = np.nan
 
             eval_rows.append({
-                "quarter_start":          q_start,
+                "period_start":          q_start,
                 "ticker":                 ticker,
                 "risk_profile":           risk_profiles[i] if risk_profiles[i] != "" else None,
                 "actual_sharpe":          float(actual_sharpe[i])  if np.isfinite(actual_sharpe[i])  else np.nan,
@@ -362,9 +362,9 @@ def classify_assets(
 
     eval_df = pd.DataFrame(eval_rows)
 
-    # Walk quarterly_data in reverse for most-recent-quarter lookups
-    for q_data in reversed(quarterly_data):
-        q_idx          = q_data["quarter_idx"]
+    # Walk semi annaul data in reverse for most-recent-period lookups
+    for q_data in reversed(period_data):
+        q_idx          = q_data["period_idx"]
         actual_fwd_vol = env._compute_forward_vol(q_idx)
         actual_fwd_ret = env._compute_forward_ret(q_idx)
         for i, ticker in enumerate(env.tickers):
@@ -384,7 +384,7 @@ def classify_assets(
 
     static_df = _build_static_df(
         env                    = env,
-        quarterly_data         = quarterly_data,
+        period_data         = period_data,
         ticker_to_latest_vol   = ticker_to_latest_vol,
         ticker_to_latest_ret   = ticker_to_latest_ret,
         ticker_to_latest_score = ticker_to_latest_score,
@@ -398,7 +398,7 @@ def classify_assets(
             agent          = agent,
             env            = env,
             history        = history,
-            quarterly_df   = quarterly_df,
+            semi_annual_df   = semi_annual_df,
             eval_df        = eval_df,
             static_df      = static_df,
             spearman_stats = spearman_stats,
@@ -407,7 +407,7 @@ def classify_assets(
             data_tickers   = data_tickers,
         )
 
-    return quarterly_df, eval_df, static_df
+    return semi_annual_df, eval_df, static_df
 
 
 #  Internal helpers 
@@ -417,9 +417,9 @@ def _log_summary(
     eval_df:        pd.DataFrame,
 ) -> None:
     logger.info("=" * 60)
-    logger.info("QUARTERLY CLASSIFICATION EVALUATION SUMMARY")
+    logger.info("SEMI ANNUAL CLASSIFICATION EVALUATION SUMMARY")
     logger.info("=" * 60)
-    logger.info("Per-quarter Spearman ρ (label rank vs actual forward vol):")
+    logger.info("Per-semi-annual period Spearman ρ (label rank vs actual forward vol):")
 
     for row in spearman_stats:
         rho_str = (
@@ -430,7 +430,7 @@ def _log_summary(
         logger.info(
             "  [%-5s]  %s  n=%2d  ρ = %s",
             row.get("split", "train").upper(),
-            row["quarter_start"].strftime("%Y-%m-%d"),
+            row["period_start"].strftime("%Y-%m-%d"),
             row["n_valid_tickers"],
             rho_str,
         )
@@ -441,7 +441,7 @@ def _log_summary(
     ]
     if rho_vals:
         logger.info(
-            "All quarters:  mean ρ = %.3f  std = %.3f  (n=%d)",
+            "All periods:  mean ρ = %.3f  std = %.3f  (n=%d)",
             float(np.mean(rho_vals)), float(np.std(rho_vals)), len(rho_vals),
         )
 
@@ -453,7 +453,7 @@ def _log_summary(
         if split_rhos:
             tag = "TRAIN" if split_label == "train" else "TEST  (held-out)"
             logger.info(
-                "  %s: mean ρ = %.3f  std = %.3f  (n=%d quarters)",
+                "  %s: mean ρ = %.3f  std = %.3f  (n=%d periods)",
                 tag,
                 float(np.mean(split_rhos)),
                 float(np.std(split_rhos)),
@@ -507,7 +507,7 @@ def _log_summary(
 
 def _build_static_df(
     env:                    AssetSelectorEnv,
-    quarterly_data:         List[Dict],
+    period_data:         List[Dict],
     ticker_to_latest_vol:   Dict[str, float],
     ticker_to_latest_ret:   Dict[str, float],
     ticker_to_latest_score: Dict[str, float],
@@ -517,8 +517,8 @@ def _build_static_df(
 
     ticker_to_latest: Dict[str, Tuple[str, pd.Timestamp]] = {}
 
-    for q_data in reversed(quarterly_data):
-        q_start = q_data["quarter_start"]
+    for q_data in reversed(period_data):
+        q_start = q_data["period_start"]
         for i, ticker in enumerate(env.tickers):
             if ticker in ticker_to_latest:
                 continue
@@ -531,7 +531,7 @@ def _build_static_df(
 
     latest_profiles    = []
     latest_cluster_ids = []
-    latest_quarters    = []
+    latest_periods    = []
     latest_scores      = []
     latest_vols        = []
     latest_rets        = []
@@ -541,11 +541,11 @@ def _build_static_df(
             rp, qs = ticker_to_latest[ticker]
             latest_profiles.append(rp)
             latest_cluster_ids.append(_profile_to_id[rp])
-            latest_quarters.append(qs)
+            latest_periods.append(qs)
         else:
             latest_profiles.append("")
             latest_cluster_ids.append(-1)
-            latest_quarters.append(pd.NaT)
+            latest_periods.append(pd.NaT)
 
         latest_scores.append(ticker_to_latest_score.get(ticker, np.nan))
         latest_vols.append(ticker_to_latest_vol.get(ticker, np.nan))
@@ -553,7 +553,7 @@ def _build_static_df(
 
     latest_profiles_arr  = np.array(latest_profiles,    dtype=object)
     latest_cluster_arr   = np.array(latest_cluster_ids, dtype=int)
-    latest_quarters_arr  = np.array(latest_quarters,    dtype=object)
+    latest_periods_arr  = np.array(latest_periods,    dtype=object)
     latest_scores_arr    = np.array(latest_scores,      dtype=np.float64)
     latest_vols_arr      = np.array(latest_vols,        dtype=np.float64)
     latest_rets_arr      = np.array(latest_rets,        dtype=np.float64)
@@ -575,7 +575,7 @@ def _build_static_df(
             for rp in latest_profiles_arr[sort_order]
         ],
         "rl_risk_score":       latest_scores_arr[sort_order],
-        "most_recent_quarter": latest_quarters_arr[sort_order],
+        "most_recent_period": latest_periods_arr[sort_order],
     })
 
     if no_data_tickers:
@@ -585,12 +585,12 @@ def _build_static_df(
         nd["cluster_id"]          = None
         nd["risk_profile"]        = None
         nd["rl_risk_score"]       = np.nan
-        nd["most_recent_quarter"] = pd.NaT
+        nd["most_recent_period"] = pd.NaT
         static_df = pd.concat([static_df, nd], ignore_index=True)
 
     static_df = static_df.reset_index(drop=True)
 
-    logger.info("Current risk profile (most recent quarter) summary:")
+    logger.info("Current risk profile (most recent semi annual period) summary:")
     for profile in ("conservative", "balanced", "aggressive"):
         grp = static_df[static_df["risk_profile"] == profile]
         if not grp.empty:
@@ -606,7 +606,7 @@ def _build_static_df(
     unclassified = static_df["risk_profile"].isna().sum()
     if unclassified:
         logger.warning(
-            "%d tickers unclassified (no valid quarterly label): %s",
+            "%d tickers unclassified (no valid semi annual label): %s",
             unclassified,
             static_df.loc[static_df["risk_profile"].isna(), "ticker"].tolist(),
         )
@@ -619,7 +619,7 @@ def _save_outputs(
     agent:          RLAssetSelectorAgent,
     env:            AssetSelectorEnv,
     history:        List[Dict],
-    quarterly_df:   pd.DataFrame,
+    semi_annual_df:   pd.DataFrame,
     eval_df:        pd.DataFrame,
     static_df:      pd.DataFrame,
     spearman_stats: List[Dict],
@@ -656,16 +656,16 @@ def _save_outputs(
     )
     logger.info("Training history saved.")
 
-    quarterly_df.to_csv(out_path / "quarterly_classifications.csv", index=False)
-    logger.info("Quarterly classifications saved (%d rows).", len(quarterly_df))
+    semi_annual_df.to_csv(out_path / "semi_annual_classifications.csv", index=False)
+    logger.info("Semi-annual classifications saved (%d rows).", len(semi_annual_df))
 
     eval_df.to_csv(out_path / "evaluation.csv", index=False)
     logger.info("Evaluation saved (%d rows).", len(eval_df))
 
     pd.DataFrame(spearman_stats).to_csv(
-        out_path / "quarterly_spearman.csv", index=False
+        out_path / "semi_annual_spearman.csv", index=False
     )
-    logger.info("Per-quarter Spearman saved.")
+    logger.info("Per-period Spearman saved.")
 
     profile_map: Dict[str, List[str]] = {
         "conservative": [],
@@ -677,12 +677,12 @@ def _save_outputs(
     for k in profile_map:
         profile_map[k] = sorted(profile_map[k])
 
-    latest_quarter_dates = (
-        static_df["most_recent_quarter"].dropna().sort_values()
+    latest_period_dates = (
+        static_df["most_recent_period"].dropna().sort_values()
     )
-    profile_map["as_of_quarter"] = (
-        str(latest_quarter_dates.iloc[-1].date())
-        if not latest_quarter_dates.empty
+    profile_map["as_of_period"] = (
+        str(latest_period_dates.iloc[-1].date())
+        if not latest_period_dates.empty
         else "unknown"
     )
 
@@ -690,8 +690,8 @@ def _save_outputs(
         json.dumps(profile_map, indent=2), encoding="utf-8"
     )
     logger.info(
-        "risk_profiles.json saved (as_of_quarter: %s).",
-        profile_map["as_of_quarter"],
+        "risk_profiles.json saved (as_of_period: %s).",
+        profile_map["as_of_period"],
     )
 
     static_df.to_csv(out_path / "asset_classification.csv", index=False)
@@ -699,12 +699,11 @@ def _save_outputs(
 
     logger.info("=" * 60)
     logger.info("Output files written to %s", out_path)
-    logger.info("  risk_profiles.json             ← downstream portfolio models")
-    logger.info("  quarterly_classifications.csv  ← full dynamic history")
-    logger.info("  evaluation.csv                 ← Sharpe / accuracy per quarter")
-    logger.info("  quarterly_spearman.csv         ← per-quarter Spearman ρ")
-    logger.info("  asset_classification.csv       ← current labels (visualiser)")
-
+    logger.info("  risk_profiles.json                  ← downstream portfolio models")
+    logger.info("  semi_annual_classifications.csv     ← full dynamic history")
+    logger.info("  evaluation.csv                      ← Sharpe / accuracy per period")
+    logger.info("  semi_annual_spearman.csv            ← per-period Spearman ρ")
+    logger.info("  asset_classification.csv            ← current labels (visualiser)")
 
 #  Utility 
 

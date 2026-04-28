@@ -268,7 +268,7 @@ class AssetSelectorEnv(gym.Env):
         self,
         ohlcv:         pd.DataFrame,
         lookback:      int           = 126,
-        forward:       int           = 63,
+        forward:       int           = 126,
         step_size:     int           = 21,
         n_clusters:    int           = 3,
         train_end_idx: Optional[int] = None,
@@ -487,7 +487,7 @@ class AssetSelectorEnv(gym.Env):
         Annualised Sharpe ratio over [idx, idx+forward).
         Returns (n_tickers,) float64, NaN where < 5 valid returns.
         """
-        fwd_end = min(idx + forward, len(self.prices))
+        fwd_end = min(idx + self.forward, len(self.prices))
         fwd_ret = self.log_returns.iloc[idx:fwd_end]
         results: List[float] = []
         for t in self.tickers:
@@ -547,15 +547,16 @@ class AssetSelectorEnv(gym.Env):
             )
             idx += self.step_size
 
-    # Quarterly grouping 
+    # semi annual grouping 
 
-    def collect_quarterly_windows(
+    def collect_period_windows(
         self,
         start_idx: Optional[int] = None,
         end_idx:   Optional[int] = None,
     ) -> List[Dict]:
         """
-        Group step indices into non-overlapping 63-day quarters.
+        Group step indices into non-overlapping 126-day semi-annual periods.
+        Each period contains approximately 6 windows at step_size=21.
         """
         idx_s        = start_idx if start_idx is not None else self._start_idx
         idx_e        = end_idx   if end_idx   is not None else self._end_idx
@@ -615,7 +616,7 @@ class AssetSelectorEnv(gym.Env):
         if thresholds is not None:
             t_low, t_high = thresholds
         else:
-            # Per-quarter tertile split — thresholds derived from this
+            # Per-semi annual period tertile split for threshold computation
            
             t_low  = float(np.percentile(scores, 33.3))
             t_high = float(np.percentile(scores, 66.7))

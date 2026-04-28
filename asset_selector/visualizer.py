@@ -72,10 +72,10 @@ def plot_cluster_assignments(
             va="center", ha="left", fontsize=7.5,
         )
 
-    ax.set_xlabel("Mean Forward 63-Day Annualised Volatility", fontsize=12)
+    ax.set_xlabel("Mean Forward 126-Day Annualised Volatility", fontsize=12)
     ax.set_title(
         "EGX30 Risk Classification — Current Labels\n"
-        "(volatility = most recent scored quarter)",
+        "(volatility = most recent semi-annual period)",
         fontsize=13, fontweight="bold",
     )
     ax.xaxis.set_major_formatter(
@@ -126,11 +126,11 @@ def plot_actual_risk_return(
             )
 
     ax.axhline(0, color="grey", linewidth=0.8, linestyle="--", alpha=0.5)
-    ax.set_xlabel("Mean Forward 63-Day Annualised Volatility", fontsize=12)
-    ax.set_ylabel("Mean Forward 63-Day Annualised Return",     fontsize=12)
+    ax.set_xlabel("Mean Forward 126-Day Annualised Volatility", fontsize=12)
+    ax.set_ylabel("Mean Forward 126-Day Annualised Return",     fontsize=12)
     ax.set_title(
         "Actual Risk-Return by Risk Profile\n"
-        "(values from most recent scored quarter per ticker)",
+        "(values from most recent semi-annual period per ticker)",
         fontsize=13, fontweight="bold",
     )
     ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0%}"))
@@ -140,7 +140,6 @@ def plot_actual_risk_return(
     fig.tight_layout()
     _save(fig, output_path)
     return fig
-
 
 
     # Identify the train/test boundary from the index
@@ -226,7 +225,7 @@ def plot_actual_risk_return(
     )
 
     ax.set_xlabel("RL Risk Score (model output)",          fontsize=12)
-    ax.set_ylabel("Actual Forward 63-Day Realised Vol",    fontsize=12)
+    ax.set_ylabel("Actual Forward 126-Day Realised Vol",    fontsize=12)
     ax.set_title(
         f"RL Predicted Risk vs Actual Forward Volatility\n"
         f"All windows × all tickers   |   Spearman ρ = {rho:.3f}",
@@ -239,7 +238,7 @@ def plot_actual_risk_return(
     _save(fig, output_path)
     return fig
 
-# Plot 4 — Classification accuracy (Spearman ρ per quarter)
+# Plot 4 — Classification accuracy (Spearman ρ per semi annaul)
 
 def plot_classification_accuracy(
     eval_df:     pd.DataFrame,
@@ -247,13 +246,13 @@ def plot_classification_accuracy(
 ) -> plt.Figure:
     _ltr = {"conservative": 0, "balanced": 1, "aggressive": 2}
 
-    quarters = sorted(eval_df["quarter_start"].dropna().unique())
+    quarters = sorted(eval_df["period_start"].dropna().unique())
     rho_vals: list[float] = []
     splits:   list[str]   = []
 
     for q in quarters:
         q_data = eval_df[
-            (eval_df["quarter_start"] == q)
+            (eval_df["period_start"] == q)
             & eval_df["actual_fwd_vol"].notna()
             & eval_df["risk_profile"].notna()
         ].copy()
@@ -271,7 +270,7 @@ def plot_classification_accuracy(
 
         # Determine split for this quarter
         q_split = eval_df.loc[
-            eval_df["quarter_start"] == q, "split"
+            eval_df["period_start"] == q, "split"
         ].iloc[0] if "split" in eval_df.columns else "train"
         splits.append(q_split)
 
@@ -315,10 +314,10 @@ def plot_classification_accuracy(
         rotation=45, ha="right", fontsize=8,
     )
     ax.set_ylim(-1.1, 1.1)
-    ax.set_xlabel("Quarter Start",  fontsize=12)
+    ax.set_xlabel("Period Start",  fontsize=12)
     ax.set_ylabel("Spearman ρ",     fontsize=12)
     ax.set_title(
-        "Quarterly Classification Accuracy\n"
+        "Semi Annual Classification Accuracy\n"
         "Spearman ρ: predicted label rank vs actual forward volatility  "
         "(hatched = held-out test)",
         fontsize=13, fontweight="bold",
@@ -349,7 +348,7 @@ def plot_classification_accuracy(
     _save(fig, output_path)
     return fig
 
-# Plot 5 — Quarterly Sharpe by risk profile
+# Plot 5 — semi annual Sharpe by risk profile
 
 def plot_quarterly_sharpe(
     eval_df:     pd.DataFrame,
@@ -358,7 +357,7 @@ def plot_quarterly_sharpe(
    
     grp = (
         eval_df.dropna(subset=["actual_sharpe", "risk_profile"])
-        .groupby(["quarter_start", "risk_profile"])["actual_sharpe"]
+        .groupby(["period_start", "risk_profile"])["actual_sharpe"]
         .mean()
         .reset_index()
     )
@@ -370,7 +369,7 @@ def plot_quarterly_sharpe(
         _save(fig, output_path)
         return fig
 
-    quarters = sorted(grp["quarter_start"].unique())
+    quarters = sorted(grp["period_start"].unique())
     x        = np.arange(len(quarters))
     width    = 0.25
 
@@ -379,7 +378,7 @@ def plot_quarterly_sharpe(
     if "split" in eval_df.columns:
         for q in quarters:
             sp = eval_df.loc[
-                eval_df["quarter_start"] == q, "split"
+                eval_df["period_start"] == q, "split"
             ].iloc[0]
             quarter_splits[q] = sp
 
@@ -390,7 +389,7 @@ def plot_quarterly_sharpe(
         pgrp = grp[grp["risk_profile"] == profile]
         vals = []
         for q in quarters:
-            row = pgrp[pgrp["quarter_start"] == q]
+            row = pgrp[pgrp["period_start"] == q]
             vals.append(
                 float(row["actual_sharpe"].values[0]) if not row.empty else 0.0
             )
@@ -432,11 +431,10 @@ def plot_quarterly_sharpe(
         [str(pd.Timestamp(q).date()) for q in quarters],
         rotation=45, ha="right", fontsize=8,
     )
-    ax.set_xlabel("Quarter Start",          fontsize=12)
-    ax.set_ylabel("Mean Actual Sharpe",     fontsize=12)
+    ax.set_xlabel("Period Start",                fontsize=12)
     ax.set_title(
-        "Quarterly Mean Sharpe Ratio by Risk Profile\n"
-        "(hatched bars = held-out test quarters)",
+        "Semi-Annual Mean Sharpe Ratio by Risk Profile\n"
+        "(hatched bars = held-out test periods)",
         fontsize=13, fontweight="bold",
     )
 
