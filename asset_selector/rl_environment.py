@@ -13,24 +13,24 @@ logger = logging.getLogger(__name__)
 TRADING_DAYS = 252
 
 FEATURE_NAMES = [
-    "realised_vol",        # annualised historical vol — HAR monthly proxy
+    "rv_monthly",          # HAR monthly: mean daily squared return 
     "momentum_63",         # 3-month price momentum
     "vol_trend",           # recent 21d vol / full-window vol
     "downside_vol",        # semi-deviation — asymmetric risk
     "beta",                # systematic risk vs equal-weight market proxy
     "volume_trend",        # recent 21d mean volume / full-window mean
-    "volume_shock",        # max volume / median volume — liquidity spike
+    "return_skewness",     # skewness of returns — asymmetric crash risk
     "vol_of_vol",          # std of rolling 21d vol — vol stability
     "vol_autocorr",        # lag-1 autocorr of squared returns — GARCH persistence
     "market_stress",       # ticker vol / cross-sectional median vol
     "pain_index",          # mean drawdown depth
     "return_consistency",  # fraction of positive-return days
-    "rv_daily",            # HAR daily: last day squared return annualised
-    "rv_weekly",           # HAR weekly: mean of last 5 daily RVs annualised
-    "cvar_95",             # CVaR 95%: mean return in worst 5% of days annualised
+    "rv_weekly",           # HAR weekly: mean of last 5 daily RVs 
+    "vol_regime",          # 1 if recent vol > full-window vol, else 0
+    "cvar_95",             # CVaR 95%: mean return in worst 5% of days
     "rolling_mdd_21",      # 21-day rolling max drawdown
     "downside_beta",       # beta on market-down days only
-    "vol_percentile_rank", # cross-sectional percentile rank of realised vol
+    "vol_percentile_rank", # cross-sectional percentile rank of rv_monthly
     "amihud_illiquidity",  # mean |return| / volume
     "atr_ratio",           # ATR / close — normalised average true range
 ]
@@ -69,7 +69,10 @@ def _window_features(
         low    = t_data["low"].dropna()
         volume = t_data["volume"].replace(0.0, np.nan).dropna()
 
-        #  1. Realised vol (HAR monthly proxy) 
+        #  1. HAR monthly: mean daily squared return, annualised
+        rv_monthly_val = float((ret.values ** 2).mean() * TRADING_DAYS)
+
+        # kept a vol estimate for internal use in other features
         vol = float(ret.std() * np.sqrt(TRADING_DAYS))
 
         #  2. 3-month momentum 
@@ -116,12 +119,8 @@ def _window_features(
             if full_mean > 1e-8:
                 volume_trend = float(volume.iloc[-21:].mean() / full_mean)
 
-        #  7. Volume shock 
-        volume_shock = np.nan
-        if len(volume) >= 10:
-            median_v = float(volume.median())
-            if median_v > 1e-8:
-                volume_shock = float(volume.max() / median_v)
+        #  7. Return skewness — asymmetric crash risk
+        return_skewness = float(ret.skew()) if n >= 10 else np.nan
 
         #  8. Vol of vol 
         vol_of_vol = np.nan
@@ -148,11 +147,14 @@ def _window_features(
         #  12. Return consistency 
         return_consistency = float((ret > 0).sum() / n)
 
-        #  13. HAR daily 
-        rv_daily = float(ret.iloc[-1] ** 2 * TRADING_DAYS)
-
-        #  14. HAR weekly 
+        #  13. HAR weekly: mean of last 5 daily squared returns, annualised
         rv_weekly = float((ret.iloc[-5:] ** 2).mean() * TRADING_DAYS)
+
+        #  14. Vol regime: 1.0 if recent vol is expanding, 0.0 if contracting
+        vol_regime = np.nan
+        if n >= 21 and vol > 1e-8:
+            recent_vol = float(ret.iloc[-21:].std() * np.sqrt(TRADING_DAYS))
+            vol_regime = 1.0 if recent_vol > vol else 0.0
 
         #  15. CVaR 95% 
         cvar_95 = np.nan
@@ -199,12 +201,12 @@ def _window_features(
                     atr_ratio = float(tr.mean() / last_close)
 
         rows.append([
-            vol, mom_63, vol_trend, downside_vol,
-            beta, volume_trend, volume_shock,
+            rv_monthly_val, mom_63, vol_trend, downside_vol,
+            beta, volume_trend, return_skewness,
             vol_of_vol, vol_autocorr,
             np.nan,             # market_stress — filled post-loop
             pain_index, return_consistency,
-            rv_daily, rv_weekly, cvar_95,
+            rv_weekly, vol_regime, cvar_95,
             rolling_mdd_21, downside_beta,
             np.nan,             # vol_percentile_rank — filled post-loop
             amihud, atr_ratio,
@@ -615,22 +617,25 @@ class AssetSelectorEnv(gym.Env):
 
         if thresholds is not None:
             t_low, t_high = thresholds
+            ids = np.where(
+                scores >= t_high, 2,
+                np.where(scores >= t_low, 1, 0),
+            )
         else:
-            # Per-semi annual period tertile split for threshold computation
-           
-            t_low  = float(np.percentile(scores, 33.3))
-            t_high = float(np.percentile(scores, 66.7))
-
-        ids = np.where(
-            scores >= t_high, 2,
-            np.where(scores >= t_low, 1, 0),
-        )
+            # Rank-based tertile split: assign cluster by rank position,
+            # cuts at n_valid/3 and 2*n_valid/3 of ranks.
+            score_ranks = pd.Series(scores).rank(method="first").values
+            third       = len(scores) / 3.0
+            
+            ids = np.where(
+                score_ranks > 2 * third, 2,
+                np.where(score_ranks > third, 1, 0),
+            )
 
         counts = np.bincount(ids, minlength=3)
         logger.info(
-            "assign_clusters: conservative=%d  balanced=%d  aggressive=%d  "
-            "(thresholds: %.4f / %.4f)",
-            counts[0], counts[1], counts[2], t_low, t_high,
+            "assign_clusters: conservative=%d  balanced=%d  aggressive=%d",
+            counts[0], counts[1], counts[2],
         )
 
         cluster_ids[valid]   = ids

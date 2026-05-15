@@ -150,10 +150,22 @@ def classify_assets(
     history:          list  = []
     es_counter:       int   = 0
     es_best_smoothed: float = -np.inf
+    best_reward:      float = -np.inf
+    best_state:       dict  = {
+        "actor":  {k: v.clone() for k, v in agent.actor.state_dict().items()},
+        "critic": {k: v.clone() for k, v in agent.critic.state_dict().items()},
+    }
 
     for ep in range(1, n_episodes + 1):
         ep_stats = agent.train_one_episode(env)
         history.append(ep_stats)
+
+        if ep_stats["mean_reward"] > best_reward:
+            best_reward = ep_stats["mean_reward"]
+            best_state = {
+                "actor":  {k: v.clone() for k, v in agent.actor.state_dict().items()},
+                "critic": {k: v.clone() for k, v in agent.critic.state_dict().items()},
+            }
 
         if ep % 10 == 0 or ep == 1:
             logger.info(
@@ -187,6 +199,13 @@ def classify_assets(
                         ep, es_best_smoothed,
                     )
                     break
+
+    # Restore best weights — PPO may have degraded since peak episode
+    agent.actor.load_state_dict(best_state["actor"])
+    agent.critic.load_state_dict(best_state["critic"])
+    logger.info(
+        "Restored best weights (peak episode reward: %.4f)", best_reward
+    )
 
     mean_rew = float(np.mean([h["mean_reward"] for h in history[-10:]]))
     logger.info("Training complete. Mean reward (last 10 episodes): %.4f", mean_rew)
@@ -236,6 +255,8 @@ def classify_assets(
     )
     for q in train_period:
         q["split"] = "train"
+
+    test_period=[]
 
     if env._test_start_idx is not None and env._test_start_idx < env._full_end_idx:
         logger.info("Semi annual inference on TEST windows …")
