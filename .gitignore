@@ -17,3 +17,8 @@ logs/
 
 # TensorBoard logs
 tensorboard/
+
+outputs/
+models/
+logs/
+data/

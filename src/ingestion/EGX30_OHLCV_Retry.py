@@ -4,9 +4,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from src.ingestion.EGX30_Client import EGXDataClient
 import time
 
-failed_tickers = ["JUFO", "ORWE"]  # Add any tickers that failed in the initial download
+failed_tickers = ["OIH"]  # Add any tickers that failed in the initial download
 
-output_dir = Path("data")
+output_dir = Path("data") / "OHLCV"
 client = EGXDataClient()
 
 print(f"Retrying {len(failed_tickers)} failed stocks with longer delays...")

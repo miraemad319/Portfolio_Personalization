@@ -16,7 +16,7 @@ def download_all_prices(n_bars=2735):
     script_dir = Path(__file__).resolve().parent  # src/ingestion/
     project_root = script_dir.parent.parent  # AI-Portfolio-Generation/
 
-    output_dir = project_root / "data"
+    output_dir = project_root / "data" / "OHLCV"
     config_path = project_root / "src" / "config" / "EGX30_Tickers.json"
 
     # Create output directory

@@ -758,3 +758,14 @@ if __name__ == "__main__":
         print(f"\nNotes: {', '.join(data['meta']['notes'])}")
     
     print("="*60)
+
+def get_real_risk_free_rate():
+    """
+    Returns the real risk-free annual rate (decimal), computed from
+    CONIA (nominal overnight) and headline inflation via Fisher.
+    Falls back to None if data is missing.
+    """
+    data = get_market_data()
+    calc = data.get("calculated", {})
+    rrfr = calc.get("real_rate_exact")  # already annual in your code
+    return rrfr
