@@ -4,13 +4,13 @@ import pandas as pd
 class EGXDataClient:
     """Client to fetch EGX stock data using egxpy."""
     
-    def fetch_stock_prices(self, ticker, n_bars=1000):
+    def fetch_stock_prices(self, ticker, n_bars=3765):
         """
         Fetch historical prices for a single stock.
         
         Args:
             ticker: Stock ticker symbol
-            n_bars: Number of bars to fetch (default 1000 days)
+            n_bars: Number of bars to fetch (default 3765 days)
         
         Returns:
             pandas DataFrame with OHLCV data
@@ -27,7 +27,7 @@ class EGXDataClient:
             print(f"Error fetching {ticker}: {e}")
             return None
     
-    def fetch_multiple_stocks(self, tickers, n_bars=1000):
+    def fetch_multiple_stocks(self, tickers, n_bars=3765):
         """Fetch data for multiple stocks."""
         all_data = {}
         for ticker in tickers:

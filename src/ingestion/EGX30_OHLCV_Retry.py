@@ -4,7 +4,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from src.ingestion.EGX30_Client import EGXDataClient
 import time
 
-failed_tickers = ["OIH"]  # Add any tickers that failed in the initial download
+failed_tickers = ["RMDA"]  # Add any tickers that failed in the initial download
 
 output_dir = Path("data") / "OHLCV"
 client = EGXDataClient()
@@ -19,7 +19,7 @@ for i, ticker in enumerate(failed_tickers, 1):
         print(f"Waiting 10s...")  # Longer delay
         time.sleep(10)
     
-    df = client.fetch_stock_prices(ticker, n_bars=2735)
+    df = client.fetch_stock_prices(ticker, n_bars=3765)
     
     if df is not None and not df.empty:
         output_file = output_dir / f"{ticker}.csv"

@@ -10,7 +10,7 @@ def load_stock_list(config_path):
         config = json.load(f)
     return config['tickers']
 
-def download_all_prices(n_bars=2735):
+def download_all_prices(n_bars=3765):
     """Download historical prices for all EGX30 stocks."""
     # Setup paths - resolve from this file's location
     script_dir = Path(__file__).resolve().parent  # src/ingestion/
