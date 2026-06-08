@@ -29,7 +29,7 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 # =============================================================================
 
 DATA_DIR = Path(__file__).parent.parent.parent / "data"
-MARKET_DATA_FILE = DATA_DIR / "market_data.csv"
+MARKET_DATA_FILE = DATA_DIR / "macro" / "market_data.csv"
 DEBUG_DIR = DATA_DIR / "debug"
 
 DATA_DIR.mkdir(exist_ok=True)
