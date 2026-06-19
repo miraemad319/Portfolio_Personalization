@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+src/.env/
+
+# Data folders
+data/
+
+logs/
+*.log
+
+# Model checkpoints
+*.zip
+
+# TensorBoard logs
+tensorboard/
