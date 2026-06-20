@@ -38,13 +38,14 @@ logger = logging.getLogger(__name__)
 
 
 def run_rl_only(
-    output_dir:     str           = "asset_selector/output",
-    n_episodes:     int           = 250,
-    train_end:      Optional[str] = "2023-12-31",
-    generate_plots: bool          = True,
-    lookback:       int           = 126,
-    forward:        int           = 126,
-    step_size:      int           = 21,
+    output_dir:      str           = "asset_selector/output",
+    n_episodes:      int           = 250,
+    train_end:       Optional[str] = "2023-12-31",
+    generate_plots:  bool          = True,
+    lookback:        int           = 126,
+    forward:         int           = 126,
+    step_size:       int           = 21,
+    composition_csv: Optional[str] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     out = Path(output_dir)
 
@@ -75,12 +76,13 @@ def run_rl_only(
     )
     semi_annual_df, eval_df, static_df = classify_assets(
         ohlcv,
-        n_episodes = n_episodes,
-        train_end  = train_end,
-        output_dir = output_dir,
-        lookback   = lookback,
-        forward    = forward,
-        step_size  = step_size,
+        n_episodes      = n_episodes,
+        train_end       = train_end,
+        output_dir      = output_dir,
+        lookback        = lookback,
+        forward         = forward,
+        step_size       = step_size,
+        composition_csv = composition_csv,
     )
 
     # Visualisation
@@ -157,6 +159,16 @@ if __name__ == "__main__":
         action  = "store_true",
         help    = "Skip generating visualisation plots",
     )
+    parser.add_argument(
+        "--composition-csv",
+        default = None,
+        metavar = "FILE",
+        help    = (
+            "Path to EGX30 composition CSV (period_date, ticker). "
+            "When provided, tertile splits are restricted to index-active "
+            "tickers for each period (Option A filtering)."
+        ),
+    )
     args = parser.parse_args()
 
     train_end_arg = (
@@ -164,11 +176,12 @@ if __name__ == "__main__":
     )
 
     run_rl_only(
-        output_dir     = args.output_dir,
-        n_episodes     = args.n_episodes,
-        train_end      = train_end_arg,
-        generate_plots = not args.no_plots,
-        lookback       = args.lookback,
-        forward        = args.forward,
-        step_size      = args.step_size,
+        output_dir      = args.output_dir,
+        n_episodes      = args.n_episodes,
+        train_end       = train_end_arg,
+        generate_plots  = not args.no_plots,
+        lookback        = args.lookback,
+        forward         = args.forward,
+        step_size       = args.step_size,
+        composition_csv = args.composition_csv,
     )

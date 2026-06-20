@@ -32,7 +32,10 @@ FEATURE_NAMES = [
     "downside_beta",       # beta on market-down days only
     "vol_percentile_rank", # cross-sectional percentile rank of rv_monthly
     "amihud_illiquidity",  # mean |return| / volume
-    "atr_ratio",           # ATR / close — normalised average true range
+    "atr_ratio",
+    "momentum_percentile_rank",  # cross-sectional percentile rank of momentum_63
+    "market_trailing_vol",       # equal-weight market annualised vol, broadcast to every ticker
+    "market_trailing_ret",       # equal-weight market annualised mean return, broadcast to every ticker          # ATR / close — normalised average true range
 ]
 
 
@@ -210,6 +213,9 @@ def _window_features(
             rolling_mdd_21, downside_beta,
             np.nan,             # vol_percentile_rank — filled post-loop
             amihud, atr_ratio,
+            np.nan,             # momentum_percentile_rank — filled post-loop
+            np.nan,             # market_trailing_vol — filled post-loop
+            np.nan,             # market_trailing_ret — filled post-loop
         ])
 
     feat_matrix = np.array(rows, dtype=np.float32)  # (n_tickers, 20)
@@ -238,18 +244,51 @@ def _window_features(
         feat_matrix[:, IDX_VOL_PERCENTILE] = np.where(
             finite_vol_mask, vol_ranks, np.nan
         )
+    #  Momentum percentile rank — cross-sectional, same treatment as vol_percentile_rank
+    IDX_MOMENTUM_PERCENTILE = 20
+    all_mom         = feat_matrix[:, 1]   # momentum_63 column
+    finite_mom_mask = np.isfinite(all_mom)
+    if finite_mom_mask.sum() >= 3:
+        mom_ranks = pd.Series(all_mom).rank(pct=True).values.astype(np.float32)
+        feat_matrix[:, IDX_MOMENTUM_PERCENTILE] = np.where(
+            finite_mom_mask, mom_ranks, np.nan
+        )
+
+    #  Market-wide regime features — identical value broadcast to every
+    #  ticker in this window. These describe the whole market's behaviour
+    #  over the window, not any one ticker's standing relative to peers,
+    #  so they must NOT be cross-sectionally z-scored (see _zscore_normalise).
+    IDX_MARKET_TRAILING_VOL = 21
+    IDX_MARKET_TRAILING_RET = 22
+
+    market_ret_series = ret_window.mean(axis=1).dropna()
+    if len(market_ret_series) >= 5:
+        market_trailing_vol = float(market_ret_series.std()  * np.sqrt(TRADING_DAYS))
+        market_trailing_ret = float(market_ret_series.mean() * TRADING_DAYS)
+        has_row = np.isfinite(feat_matrix[:, 0])  # tickers that got a real row this window
+        feat_matrix[has_row, IDX_MARKET_TRAILING_VOL] = market_trailing_vol
+        feat_matrix[has_row, IDX_MARKET_TRAILING_RET] = market_trailing_ret
 
     return feat_matrix
 
+BROADCAST_COLS  = {21, 22}
+BROADCAST_SCALE = 0.3  # rough typical annualised equity vol/return magnitude
 
 def _zscore_normalise(X: np.ndarray) -> np.ndarray:
     """
     Cross-sectional z-score: normalise each feature column across tickers.
     Columns that are entirely NaN or have zero std are set to 0.
+    Columns in BROADCAST_COLS are market-wide (identical across tickers in
+    a window) and are rescaled by a fixed divisor instead of z-scored.
     """
     out = np.zeros_like(X)
     for j in range(X.shape[1]):
-        col   = X[:, j]
+        col = X[:, j]
+        if j in BROADCAST_COLS:
+            out[:, j] = np.where(
+                np.isfinite(col), np.clip(col / BROADCAST_SCALE, -10.0, 10.0), 0.0
+            )
+            continue
         valid = col[np.isfinite(col)]
         if len(valid) < 2:
             continue
@@ -503,16 +542,9 @@ class AssetSelectorEnv(gym.Env):
         return np.array(results, dtype=np.float64)
 
     def _compute_reward(self, idx: int, risk_scores: np.ndarray) -> float:
-        """
-        Composite Spearman reward.
-
-        Target rank = 0.7 × rank(fwd_vol) + 0.3 × rank(fwd_max_dd),
-        computed over the intersection of tickers where BOTH forward
-        labels are finite. Returns 0.0 if fewer than 3 valid tickers.
-        """
-        fwd_vol  = self._compute_forward_vol(idx)
-        fwd_dd   = self._compute_forward_max_dd(idx)
-        has_data = self._get_valid_mask(idx)
+        fwd_vol    = self._compute_forward_vol(idx)
+        fwd_dd     = self._compute_forward_max_dd(idx)
+        has_data   = self._get_valid_mask(idx)
 
         valid = (
             has_data
@@ -523,14 +555,13 @@ class AssetSelectorEnv(gym.Env):
         if valid.sum() < 3:
             return 0.0
 
-        vol_rank       = pd.Series(fwd_vol[valid]).rank(pct=True).values.astype(np.float64)
-        dd_rank        = pd.Series(fwd_dd[valid]).rank(pct=True).values.astype(np.float64)
-        composite_rank = 0.7 * vol_rank + 0.3 * dd_rank
+        vol_rank = pd.Series(fwd_vol[valid]).rank(pct=True).values.astype(np.float64)
+        dd_rank  = pd.Series(fwd_dd[valid]).rank(pct=True).values.astype(np.float64)
+
+        composite_rank = 0.6 * vol_rank + 0.4 * dd_rank
 
         rho, _ = spearmanr(risk_scores[valid], composite_rank)
         return float(rho) if np.isfinite(rho) else 0.0
-
-    # Inference iteration 
 
     def iter_all_windows(
         self,
@@ -551,40 +582,80 @@ class AssetSelectorEnv(gym.Env):
 
     # semi annual grouping 
 
+    _REBALANCE_MONTHS: List[Tuple[int, int]] = [(1, 1), (7, 1)]
+
+    @staticmethod
+    def _build_rebalance_dates(first_year: int, last_year: int) -> List[pd.Timestamp]:
+        """
+        Generate all Jan 1 and Jul 1 timestamps for the given year range,
+        sorted ascending. These are the EGX30 rebalancing boundaries.
+        """
+        dates = []
+        for year in range(first_year, last_year + 1):
+            for month, day in AssetSelectorEnv._REBALANCE_MONTHS:
+                dates.append(pd.Timestamp(year=year, month=month, day=day))
+        return sorted(dates)
+
+    def _date_to_idx(self, date: pd.Timestamp) -> int:
+        """
+        Return the row index of the first trading day >= date.
+        Clamps to [0, len(prices)-1].
+        """
+        pos = self.prices.index.searchsorted(date, side="left")
+        return int(np.clip(pos, 0, len(self.prices) - 1))
+
     def collect_period_windows(
         self,
         start_idx: Optional[int] = None,
         end_idx:   Optional[int] = None,
     ) -> List[Dict]:
         """
-        Group step indices into non-overlapping 126-day semi-annual periods.
-        Each period contains approximately 6 windows at step_size=21.
+        Group step indices into non-overlapping semi-annual periods anchored
+        to Jan 1 and Jul 1 — matching the EGX30 rebalancing calendar.
+        A window falling in April belongs to the Jan-Jun bucket, not an
+        arbitrary block starting from wherever the data begins.
         """
-        idx_s        = start_idx if start_idx is not None else self._start_idx
-        idx_e        = end_idx   if end_idx   is not None else self._end_idx
-        quarter_size = self.forward
+        idx_s = start_idx if start_idx is not None else self._start_idx
+        idx_e = end_idx   if end_idx   is not None else self._end_idx
 
         all_steps = list(range(idx_s, idx_e, self.step_size))
         if not all_steps:
             return []
 
+        # Build rebalancing boundaries spanning the full data range
+        first_year = self.prices.index[idx_s].year - 1
+        last_year  = self.prices.index[min(idx_e, len(self.prices) - 1)].year + 1
+        rb_dates   = self._build_rebalance_dates(first_year, last_year)
+
+        # For every step index find which rebalancing boundary it belongs to
+        steps_arr = np.array(
+            [self.prices.index[min(i, len(self.prices) - 1)] for i in all_steps],
+            dtype="datetime64[ns]",
+        )
+        rb_arr = np.array(rb_dates, dtype="datetime64[ns]")
+
+        # searchsorted gives the index of the next boundary AFTER each step,
+        # so subtract 1 to get the boundary the step falls under
+        period_assignments = np.searchsorted(rb_arr, steps_arr, side="right") - 1
+        period_assignments = np.clip(period_assignments, 0, len(rb_dates) - 1)
+
+        # Group step indices by their assigned boundary
+        from collections import defaultdict
+        buckets: Dict[int, List[int]] = defaultdict(list)
+        for step_idx, period_pos in zip(all_steps, period_assignments):
+            buckets[int(period_pos)].append(step_idx)
+
         quarters: List[Dict] = []
-        q_num = 0
-        while True:
-            q_start_idx    = idx_s + q_num * quarter_size
-            q_end_idx      = q_start_idx + quarter_size
-            if q_start_idx >= idx_e:
-                break
-            window_indices = [i for i in all_steps if q_start_idx <= i < q_end_idx]
-            if window_indices:
-                quarters.append({
-                    "quarter_start":  self.prices.index[
-                        min(q_start_idx, len(self.prices) - 1)
-                    ],
-                    "quarter_idx":    q_start_idx,
-                    "window_indices": window_indices,
-                })
-            q_num += 1
+        for period_pos in sorted(buckets.keys()):
+            window_indices  = buckets[period_pos]
+            period_date     = rb_dates[period_pos]
+            period_row_idx  = self._date_to_idx(period_date)
+
+            quarters.append({
+                "quarter_start":  period_date,
+                "quarter_idx":    period_row_idx,
+                "window_indices": window_indices,
+            })
 
         return quarters
 

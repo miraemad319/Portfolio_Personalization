@@ -207,16 +207,17 @@ def _load_ohlcv(
 # Pipeline 
 
 def run_pipeline(
-    output_dir:     str            = "asset_selector/output",
-    generate_plots: bool           = True,
-    n_episodes:     int            = 250,
-    start:          date           = date(2018, 1, 1),
-    end:            Optional[date] = None,
-    train_end:      Optional[str]  = "2023-12-31",
-    prices_dir:     Optional[str]  = None,
-    lookback:       int            = 126,
-    forward:        int            = 126,
-    step_size:      int            = 21,
+    output_dir:      str            = "asset_selector/output",
+    generate_plots:  bool           = True,
+    n_episodes:      int            = 250,
+    start:           date           = date(2018, 1, 1),
+    end:             Optional[date] = None,
+    train_end:       Optional[str]  = "2023-12-31",
+    prices_dir:      Optional[str]  = None,
+    lookback:        int            = 126,
+    forward:         int            = 21,
+    step_size:       int            = 21,
+    composition_csv: Optional[str]  = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     out  = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -253,12 +254,13 @@ def run_pipeline(
     logger.info("=" * 60)
     semi_annual_df, eval_df, static_df = classify_assets(
         ohlcv,
-        n_episodes = n_episodes,
-        train_end  = train_end,
-        output_dir = output_dir,
-        lookback   = lookback,
-        forward    = forward,
-        step_size  = step_size,
+        n_episodes      = n_episodes,
+        train_end       = train_end,
+        output_dir      = output_dir,
+        lookback        = lookback,
+        forward         = forward,
+        step_size       = step_size,
+        composition_csv = composition_csv,
     )
 
     # Stage 4: Visualisation
@@ -326,6 +328,16 @@ def _cli() -> None:
             "Pass 'none' to disable the split and train on all data."
         ),
     )
+    parser.add_argument(
+        "--composition-csv",
+        default = None,
+        metavar = "FILE",
+        help    = (
+            "Path to EGX30 composition CSV (period_date, ticker). "
+            "When provided, tertile splits are restricted to index-active "
+            "tickers for each period (Option A filtering)."
+        ),
+    )
     args = parser.parse_args()
 
     train_end_arg = (
@@ -333,11 +345,12 @@ def _cli() -> None:
     )
 
     run_pipeline(
-        output_dir     = args.output_dir,
-        generate_plots = not args.no_plots,
-        n_episodes     = args.n_episodes,
-        train_end      = train_end_arg,
-        prices_dir     = args.prices_dir,
+        output_dir      = args.output_dir,
+        generate_plots  = not args.no_plots,
+        n_episodes      = args.n_episodes,
+        train_end       = train_end_arg,
+        prices_dir      = args.prices_dir,
+        composition_csv = args.composition_csv,
     )
 
 

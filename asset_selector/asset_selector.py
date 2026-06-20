@@ -45,19 +45,68 @@ from asset_selector.rl_agent import RLAssetSelectorAgent
 logger = logging.getLogger(__name__)
 
 #  Public API 
+def load_composition(csv_path: str) -> Dict[pd.Timestamp, set]:
+    """
+    Load the EGX30 composition CSV into a dict mapping each period's
+    Timestamp to the set of tickers active in that period.
+
+    The CSV must have columns: period_date, ticker
+    """
+    df = pd.read_csv(csv_path, parse_dates=["period_date"])
+    composition: Dict[pd.Timestamp, set] = {}
+    for date, group in df.groupby("period_date"):
+        composition[pd.Timestamp(date)] = set(group["ticker"].str.strip().tolist())
+    logger.info(
+        "Loaded composition table: %d periods from %s to %s",
+        len(composition),
+        min(composition).date(),
+        max(composition).date(),
+    )
+    return composition
+
+
+def get_active_tickers(
+    composition: Dict[pd.Timestamp, set],
+    period_date: pd.Timestamp,
+) -> Optional[set]:
+    """
+    Return the set of tickers active at period_date by finding the
+    most-recent composition snapshot whose date is <= period_date.
+    Returns None if the composition table is empty or predates all data.
+    """
+    if not composition:
+        return None
+    past = [d for d in composition if d <= period_date]
+    if not past:
+        # period_date is before the earliest snapshot — use the earliest
+        return composition[min(composition)]
+    return composition[max(past)]
+
+
 def classify_assets(
-    ohlcv:      pd.DataFrame,
-    n_clusters: int           = 3,
-    n_episodes: int           = 250,
-    lookback:   int           = 126,
-    forward:    int           = 126,
-    step_size:  int           = 21,
-    train_end:  Optional[str] = "2023-12-31",
-    output_dir: Optional[str] = None,
+    ohlcv:           pd.DataFrame,
+    n_clusters:      int           = 3,
+    n_episodes:      int           = 250,
+    lookback:        int           = 126,
+    forward:         int           = 21,
+    step_size:       int           = 21,
+    train_end:       Optional[str] = "2023-12-31",
+    output_dir:      Optional[str] = None,
+    composition_csv: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
    
     if n_clusters != 3:
         raise ValueError("classify_assets supports n_clusters=3 only.")
+
+    # Load composition table if provided
+    composition: Dict[pd.Timestamp, set] = {}
+    if composition_csv is not None:
+        composition = load_composition(composition_csv)
+    else:
+        logger.warning(
+            "No composition_csv provided — tertile splits will use all tickers "
+            "in every period regardless of EGX30 membership."
+        )
 
     all_tickers = ohlcv.columns.get_level_values("ticker").unique().tolist()
     if not all_tickers:
@@ -249,9 +298,10 @@ def classify_assets(
     logger.info("Semi-annual inference on TRAIN windows …")
     train_period = agent.collect_period_scores(
         env,
-        start_idx  = env._start_idx,
-        end_idx    = env._end_idx,
-        thresholds = None,
+        start_idx   = env._start_idx,
+        end_idx     = env._end_idx,
+        thresholds  = None,
+        composition = composition,
     )
     for q in train_period:
         q["split"] = "train"
@@ -262,9 +312,10 @@ def classify_assets(
         logger.info("Semi annual inference on TEST windows …")
         test_period = agent.collect_period_scores(
             env,
-            start_idx  = env._test_start_idx,
-            end_idx    = env._full_end_idx,
-            thresholds = None,
+            start_idx   = env._test_start_idx,
+            end_idx     = env._full_end_idx,
+            thresholds  = None,
+            composition = composition,
         )
         for q in test_period:
             q["split"] = "test"

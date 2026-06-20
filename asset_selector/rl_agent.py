@@ -249,18 +249,22 @@ class RLAssetSelectorAgent:
         windows_ranks: List[torch.Tensor] = []
 
         for _date, obs, idx, valid_mask in env.iter_all_windows():
-            fwd_vol = env._compute_forward_vol(idx)
-            fwd_dd  = env._compute_forward_max_dd(idx)
+            fwd_vol    = env._compute_forward_vol(idx)
+            fwd_dd     = env._compute_forward_max_dd(idx)
 
-            # Intersection mask: both forward labels must be finite
-            valid = valid_mask & np.isfinite(fwd_vol) & np.isfinite(fwd_dd)
+            # Intersection mask: all three forward labels must be finite
+            valid = (
+                valid_mask
+                & np.isfinite(fwd_vol)
+                & np.isfinite(fwd_dd)
+            )
             if valid.sum() < 3:
                 continue
 
             # Composite rank — identical formula to _compute_reward
-            vol_rank = pd.Series(fwd_vol[valid]).rank(pct=True).values.astype(np.float32)
-            dd_rank  = pd.Series(fwd_dd[valid]).rank(pct=True).values.astype(np.float32)
-            composite_rank = (0.7 * vol_rank + 0.3 * dd_rank).astype(np.float32)
+            vol_rank    = pd.Series(fwd_vol[valid]).rank(pct=True).values.astype(np.float32)
+            dd_rank     = pd.Series(fwd_dd[valid]).rank(pct=True).values.astype(np.float32)
+            composite_rank = (0.6 * vol_rank + 0.4 * dd_rank).astype(np.float32)
 
             obs_t = torch.nan_to_num(
                 torch.tensor(obs[valid], dtype=torch.float32).to(self.device),
@@ -607,6 +611,7 @@ class RLAssetSelectorAgent:
         start_idx:  Optional[int]                  = None,
         end_idx:    Optional[int]                  = None,
         thresholds: Optional[Tuple[float, float]]  = None,
+        composition: Optional[Dict[pd.Timestamp, set]] = None,
     ) -> List[Dict]:
         quarters = env.collect_period_windows(
             start_idx=start_idx, end_idx=end_idx
@@ -630,6 +635,25 @@ class RLAssetSelectorAgent:
             with np.errstate(all="ignore"):  # suppress Mean of empty slice
                 mean_scores = np.nanmean(score_arr, axis=0)
                 mean_scores[np.isfinite(score_arr).sum(axis=0) < 3] = np.nan
+
+            # ── Option A: filter to EGX30-active tickers before tertile split ──
+            if composition:
+                from asset_selector.asset_selector import get_active_tickers
+                period_date = pd.Timestamp(q["quarter_start"])
+                active_set  = get_active_tickers(composition, period_date)
+                if active_set is not None:
+                    inactive_mask = np.array(
+                        [t not in active_set for t in env.tickers]
+                    )
+                    n_masked = int(inactive_mask.sum())
+                    if n_masked:
+                        mean_scores[inactive_mask] = np.nan
+                        logger.debug(
+                            "Period %s: masked %d non-index tickers before "
+                            "tertile split (active=%d)",
+                            period_date.date(), n_masked,
+                            int((~inactive_mask).sum()),
+                        )
 
             cluster_ids, risk_profiles = env.assign_clusters(
                 mean_scores, thresholds=thresholds
