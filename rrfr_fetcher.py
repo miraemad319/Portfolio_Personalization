@@ -29,12 +29,12 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 # =============================================================================
 
 DATA_DIR = Path(__file__).parent.parent.parent / "data"
-MARKET_DATA_FILE = DATA_DIR / "macro" / "market_data.csv"
+MARKET_DATA_FILE = DATA_DIR / "macro_signals" / "market_data.csv"
 DEBUG_DIR = DATA_DIR / "debug"
 
 DATA_DIR.mkdir(exist_ok=True)
 DEBUG_DIR.mkdir(exist_ok=True)
-
+MARKET_DATA_FILE.parent.mkdir(exist_ok=True)
 CONIA_URL = "https://www.cbe.org.eg/en/economic-research/statistics/conia"
 INFLATION_URL = "https://www.cbe.org.eg/en/economic-research/statistics/inflation-rates"
 
