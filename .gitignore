@@ -4,21 +4,14 @@ __pycache__/
 
 # Virtual environment
 venv/
-src/.env/
-
-# Data folders
-data/
-
-logs/
 *.log
 
-# Model checkpoints
-*.zip
+# VS Code
+.vscode/
 
-# TensorBoard logs
-tensorboard/
+# Claude
+.sixth
 
-outputs/
-models/
-logs/
-data/
+# Other
+data/OHLCV
+model_versions/

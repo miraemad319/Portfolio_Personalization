@@ -46,6 +46,5 @@ html5lib>=1.1
 selenium
 webdriver_manager
 
+# Other
 openpyxl
-
-torch
